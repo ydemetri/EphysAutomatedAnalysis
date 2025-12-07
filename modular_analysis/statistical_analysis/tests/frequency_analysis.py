@@ -25,6 +25,8 @@ from .posthoc_utils import (
 
 logger = logging.getLogger(__name__)
 
+MIN_CELLS_PER_GROUP = 3
+
 
 def _get_effect_pvalue(model, param_names: list, data: pd.DataFrame, formula: str, 
                        groups_col: str, re_formula: str, effect_name: str = "") -> float:
@@ -308,6 +310,11 @@ class FrequencyAnalyzer:
         stat_data = []
         
         for i in range(num_tests):
+            # Require minimum cells from both groups at this step
+            n1 = df_group1['n'].iloc[i] if 'n' in df_group1.columns else group1_vals.iloc[i].count()
+            n2 = df_group2['n'].iloc[i] if 'n' in df_group2.columns else group2_vals.iloc[i].count()
+            if n1 < MIN_CELLS_PER_GROUP or n2 < MIN_CELLS_PER_GROUP:
+                continue
             try:
                 t_stat, p_val = ttest_ind(
                     np.array(group1_vals.iloc[i]), np.array(group2_vals.iloc[i]),
@@ -533,49 +540,61 @@ class FrequencyAnalyzer:
                     step_value = 0.5 + (step_idx * 0.5)  # Default fallback
                 step_label = 'Fold Rheobase'
             
-            # Collect data for this step from all groups
+            # Collect data for this step from all groups and enforce minimum cells per group
             group_data_lists = []
             group_stats = {}
+            group_step_values = {}
+            insufficient_groups = set()
             
             for group_name in group_names:
                 group_data = all_group_data[group_name]
-                if step_idx < len(group_data):
-                    # Get frequency values for this step (across all cells)
-                    value_cols = [col for col in group_data.columns if 'Value' in col]
-                    step_data = group_data.iloc[step_idx][value_cols].dropna()
-                    
-                    if len(step_data) > 1:
-                        group_data_lists.append(step_data)
-                        group_stats[group_name] = {
-                            'mean': step_data.mean(),
-                            'stderr': step_data.std() / np.sqrt(len(step_data)),
-                            'n': len(step_data)
-                        }
-            
-            if len(group_data_lists) < 2:
-                continue
+                if step_idx >= len(group_data):
+                    insufficient_groups.add(group_name)
+                    continue
                 
+                # Get frequency values for this step (across all cells)
+                value_cols = [col for col in group_data.columns if 'Value' in col]
+                step_data = group_data.iloc[step_idx][value_cols].dropna()
+                
+                if len(step_data) >= MIN_CELLS_PER_GROUP:
+                    group_step_values[group_name] = step_data
+                    group_stats[group_name] = {
+                        'mean': step_data.mean(),
+                        'stderr': step_data.std() / np.sqrt(len(step_data)),
+                        'n': len(step_data)
+                    }
+                else:
+                    insufficient_groups.add(group_name)
+            
+            if len(group_step_values) != len(group_names):
+                logger.info(
+                    f"Skipping {step_label} {step_value}: insufficient data for "
+                    f"{sorted(insufficient_groups)} (need >= {MIN_CELLS_PER_GROUP} cells per group)"
+                )
+                continue
+            
+            # Preserve original ordering for ANOVA input
+            group_data_lists = [group_step_values[name] for name in group_names]
+            
             # Run ANOVA (one-way or two-way depending on design)
             try:
                 if is_factorial:
                     # Build dataframe with factor labels for two-way ANOVA
                     data_list = []
                     for group_name in group_names:
-                        if group_name in all_group_data:
-                            group_data = all_group_data[group_name]
-                            if step_idx < len(group_data):
-                                value_cols = [col for col in group_data.columns if 'Value' in col]
-                                step_data = group_data.iloc[step_idx][value_cols].dropna()
-                                
-                                factor1_level = design.factor_mapping[group_name]['factor1']
-                                factor2_level = design.factor_mapping[group_name]['factor2']
-                                
-                                for val in step_data:
-                                    data_list.append({
-                                        'frequency': val,
-                                        'factor1': factor1_level,
-                                        'factor2': factor2_level
-                                    })
+                        step_data = group_step_values.get(group_name)
+                        if step_data is None:
+                            continue
+                        
+                        factor1_level = design.factor_mapping[group_name]['factor1']
+                        factor2_level = design.factor_mapping[group_name]['factor2']
+                        
+                        for val in step_data:
+                            data_list.append({
+                                'frequency': val,
+                                'factor1': factor1_level,
+                                'factor2': factor2_level
+                            })
                     
                     if len(data_list) >= 4:
                         df = pd.DataFrame(data_list)
@@ -715,6 +734,7 @@ class FrequencyAnalyzer:
                         # Collect data for this step from all groups
                         step_group_data = {}
                         step_group_stats = {}
+                        missing_groups = set()
                         
                         for group_name in group_names:
                             group_data = all_group_data[group_name]
@@ -722,13 +742,24 @@ class FrequencyAnalyzer:
                                 value_cols = [col for col in group_data.columns if 'Value' in col]
                                 step_data = group_data.iloc[step_idx][value_cols].dropna()
                                 
-                                if len(step_data) > 1:
+                                if len(step_data) >= MIN_CELLS_PER_GROUP:
                                     step_group_data[group_name] = step_data
                                     step_group_stats[group_name] = {
                                         'mean': step_data.mean(),
                                         'stderr': step_data.std() / np.sqrt(len(step_data)),
                                         'n': len(step_data)
                                     }
+                                else:
+                                    missing_groups.add(group_name)
+                            else:
+                                missing_groups.add(group_name)
+                        
+                        if len(step_group_data) != len(group_names):
+                            logger.info(
+                                f"Skipping post-hoc tests at {step_label} {step_value}: insufficient data for "
+                                f"{sorted(missing_groups)} (need >= {MIN_CELLS_PER_GROUP} cells per group)"
+                            )
+                            continue
                         
                         if result.get('Test_Type') == 'Two-Way ANOVA':
                             reasons = posthoc_decision.get('reasons', []) if posthoc_decision else []

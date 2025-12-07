@@ -23,6 +23,8 @@ from .posthoc_utils import (
 
 logger = logging.getLogger(__name__)
 
+MIN_CELLS_PER_UNIT = 3
+
 
 def _pair_subject_value_columns(df: pd.DataFrame) -> List[Tuple[str, str]]:
     subject_cols = [col for col in df.columns if col.startswith('Subject_')]
@@ -257,7 +259,7 @@ class FrequencyAnalyzerDependent:
                             data2_list.append(val2)
                             subjects.append(subject_col)
                 
-                if len(data1_list) < 3:
+                if len(data1_list) < MIN_CELLS_PER_UNIT:
                     continue
                 
                 # Run paired t-test
@@ -312,7 +314,7 @@ class FrequencyAnalyzerDependent:
                                 data1_list.append(val1)
                                 data2_list.append(val2)
                 
-                if len(data1_list) < 3:
+                if len(data1_list) < MIN_CELLS_PER_UNIT:
                     continue
                 
                 # Run paired t-test
@@ -716,7 +718,7 @@ class FrequencyAnalyzerDependent:
                                     'Frequency': freq
                                 })
                 
-                if len(long_data) < len(within_levels) * 3:
+                if len(long_data) < len(within_levels) * MIN_CELLS_PER_UNIT:
                     continue
                 
                 df_long = pd.DataFrame(long_data)
@@ -787,7 +789,7 @@ class FrequencyAnalyzerDependent:
                         if len(val1) > 0 and len(val2) > 0:
                             paired_data1.append(val1.iloc[0])
                             paired_data2.append(val2.iloc[0])
-                    if len(paired_data1) >= 3:
+                    if len(paired_data1) >= MIN_CELLS_PER_UNIT:
                         t_result = pg.ttest(np.array(paired_data1), np.array(paired_data2), paired=True)
                         posthoc_p = t_result['p-val'].values[0]
                         result[f'{cond1}_vs_{cond2}_posthoc_p'] = posthoc_p

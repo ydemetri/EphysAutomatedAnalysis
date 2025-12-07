@@ -23,6 +23,8 @@ from .posthoc_utils import (
 
 logger = logging.getLogger(__name__)
 
+MIN_CELLS_PER_GROUP = 3
+
 
 def _get_effect_pvalue(model, param_names: list, data: pd.DataFrame, formula: str, 
                        groups_col: str, re_formula: str, effect_name: str = "") -> float:
@@ -214,6 +216,8 @@ class AttenuationAnalyzer:
             # Collect data for this AP position from all groups
             group_data_lists = []
             group_stats = {}
+            group_ap_values = {}
+            insufficient_groups = set()
             
             for group_name in group_names:
                 group_data = all_group_data[group_name]
@@ -221,38 +225,46 @@ class AttenuationAnalyzer:
                     # All columns are already value columns (filtered during loading)
                     ap_data = group_data.iloc[ap_index].dropna()
                     
-                    if len(ap_data) > 1:
-                        group_data_lists.append(ap_data)
+                    if len(ap_data) >= MIN_CELLS_PER_GROUP:
+                        group_ap_values[group_name] = ap_data
                         group_stats[group_name] = {
                             'mean': ap_data.mean(),
                             'stderr': ap_data.std() / np.sqrt(len(ap_data)),
                             'n': len(ap_data)
                         }
+                    else:
+                        insufficient_groups.add(group_name)
+                else:
+                    insufficient_groups.add(group_name)
             
-            if len(group_data_lists) < 2:
+            if len(group_ap_values) != len(group_names):
+                logger.info(
+                    f"Skipping AP {ap_pos}: insufficient data for "
+                    f"{sorted(insufficient_groups)} (need >= {MIN_CELLS_PER_GROUP} cells per group)"
+                )
                 continue
-                
+            
+            group_data_lists = [group_ap_values[name] for name in group_names]
+            
             # Run ANOVA (one-way or two-way depending on design)
             try:
                 if is_factorial:
                     # Build dataframe with factor labels for two-way ANOVA
                     data_list = []
                     for group_name in group_names:
-                        if group_name in all_group_data:
-                            group_data = all_group_data[group_name]
-                            if ap_index < len(group_data):
-                                # All columns are already value columns (filtered during loading)
-                                ap_data = group_data.iloc[ap_index].dropna()
-                                
-                                factor1_level = design.factor_mapping[group_name]['factor1']
-                                factor2_level = design.factor_mapping[group_name]['factor2']
-                                
-                                for val in ap_data:
-                                    data_list.append({
-                                        'peak': val,
-                                        'factor1': factor1_level,
-                                        'factor2': factor2_level
-                                    })
+                        ap_data = group_ap_values.get(group_name)
+                        if ap_data is None:
+                            continue
+                        
+                        factor1_level = design.factor_mapping[group_name]['factor1']
+                        factor2_level = design.factor_mapping[group_name]['factor2']
+                        
+                        for val in ap_data:
+                            data_list.append({
+                                'peak': val,
+                                'factor1': factor1_level,
+                                'factor2': factor2_level
+                            })
                     
                     if len(data_list) < 4:
                         continue
@@ -388,6 +400,7 @@ class AttenuationAnalyzer:
                         # Collect data for this AP from all groups
                         ap_group_data = {}
                         ap_group_stats = {}
+                        missing_groups = set()
                         
                         for group_name in group_names:
                             group_data = all_group_data[group_name]
@@ -395,13 +408,24 @@ class AttenuationAnalyzer:
                                 # Get values for this AP across all cells
                                 ap_values = group_data.iloc[ap_idx].dropna()
                                 
-                                if len(ap_values) > 1:
+                                if len(ap_values) >= MIN_CELLS_PER_GROUP:
                                     ap_group_data[group_name] = ap_values
                                     ap_group_stats[group_name] = {
                                         'mean': ap_values.mean(),
                                         'stderr': ap_values.std() / np.sqrt(len(ap_values)),
                                         'n': len(ap_values)
                                     }
+                                else:
+                                    missing_groups.add(group_name)
+                            else:
+                                missing_groups.add(group_name)
+                        
+                        if len(ap_group_data) != len(group_names):
+                            logger.info(
+                                f"Skipping attenuation post-hocs at AP {ap_pos}: insufficient data for "
+                                f"{sorted(missing_groups)} (need >= {MIN_CELLS_PER_GROUP} cells per group)"
+                            )
+                            continue
                         
                         if result.get('Test_Type') == 'Two-Way ANOVA':
                             reasons = posthoc_decision.get('reasons', []) if posthoc_decision else []

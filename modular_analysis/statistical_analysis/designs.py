@@ -465,9 +465,9 @@ class DesignManager:
             # Independent Groups
             "2 independent groups - 1 factor (between), 2 levels (A vs B)": DesignType.INDEPENDENT_TWO_GROUP,
             "3+ independent groups - 1 factor (between), 3+ levels (A vs B vs C...)": DesignType.INDEPENDENT_MULTI_GROUP,
-            "Factorial design - 2+ factors (between), 2+ levels each (A1 vs A2 vs B1 vs B2)": DesignType.FACTORIAL_2X2,
+            "Factorial design - 2 factors (between), 2+ levels each (A1 vs A2... vs B1 vs B2...)": DesignType.FACTORIAL_2X2,
             # Repeated Measures
             "Paired design - 1 factor (within), 2 levels (A vs A')": DesignType.PAIRED_TWO_GROUP,
             "Repeated measures - 1 factor (within), 3+ levels (A vs A' vs A''...)": DesignType.REPEATED_MEASURES,
-            "Mixed factorial - 1 factor (between) + 1 factor (within) (A vs A' vs B vs B')": DesignType.MIXED_FACTORIAL,
+            "Mixed factorial - 1 factor (between) + 1 factor (within) (A vs A'... vs B vs B'...)": DesignType.MIXED_FACTORIAL,
         }

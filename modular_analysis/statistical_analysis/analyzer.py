@@ -6,6 +6,7 @@ import os
 import logging
 from typing import List, Dict, Optional
 import pandas as pd
+from datetime import datetime
 
 from .designs import DesignManager
 from .tests.unpaired_ttest import UnpairedTTest
@@ -42,6 +43,10 @@ class StatisticalAnalyzer:
         
         logger.info(f"Starting analysis: {design.name}")
         
+        log_handler = None
+        log_file_path = None
+        root_logger = logging.getLogger()
+        
         # Validate design
         errors = DesignManager.validate_design(design)
         if errors:
@@ -54,10 +59,24 @@ class StatisticalAnalyzer:
             'attenuation_analysis': {},
             'mixed_effects_results': [],
             'plot_files': {},
-            'success': False
+            'success': False,
+            'log_file': None
         }
         
         try:
+            # Set up run-specific log file
+            results_dir = os.path.join(base_path, self.config.output_dir)
+            os.makedirs(results_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_file_path = os.path.join(results_dir, f"analysis_{timestamp}.log")
+            log_handler = logging.FileHandler(log_file_path, mode='w', encoding='utf-8')
+            log_handler.setLevel(logging.INFO)
+            formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+            log_handler.setFormatter(formatter)
+            root_logger.addHandler(log_handler)
+            results['log_file'] = log_file_path
+            logger.info(f"Analysis log file: {log_file_path}")
+            
             # For dependent designs (mixed factorial, paired, and repeated measures), add Subject_IDs to extracted CSVs first
             if design.design_type in [DesignType.MIXED_FACTORIAL, DesignType.PAIRED_TWO_GROUP, DesignType.REPEATED_MEASURES]:
                 design_label = "paired design" if design.design_type == DesignType.PAIRED_TWO_GROUP else "mixed design"
@@ -102,6 +121,11 @@ class StatisticalAnalyzer:
         except Exception as e:
             logger.error(f"Error during analysis: {e}")
             results['error'] = str(e)
+            
+        finally:
+            if log_handler:
+                root_logger.removeHandler(log_handler)
+                log_handler.close()
             
         return results
     

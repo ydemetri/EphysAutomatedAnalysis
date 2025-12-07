@@ -23,6 +23,8 @@ from .posthoc_utils import (
 
 logger = logging.getLogger(__name__)
 
+MIN_CELLS_PER_UNIT = 3
+
 
 def _pair_subject_value_columns(df: pd.DataFrame) -> List[Tuple[str, str]]:
     subject_cols = [col for col in df.columns if col.startswith('Subject_')]
@@ -269,7 +271,7 @@ class AttenuationAnalyzerDependent:
                         data1_list.append(val1)
                         data2_list.append(val2)
             
-            if len(data1_list) < 3:
+            if len(data1_list) < MIN_CELLS_PER_UNIT:
                 continue
             
             # Run paired t-test
@@ -539,7 +541,7 @@ class AttenuationAnalyzerDependent:
                                 'Peak': peak
                             })
             
-            if len(long_data) < len(within_levels) * 3:  # Need at least 3 subjects with complete data
+            if len(long_data) < len(within_levels) * MIN_CELLS_PER_UNIT:
                 continue
             
             df_long = pd.DataFrame(long_data)
@@ -608,7 +610,7 @@ class AttenuationAnalyzerDependent:
                         if len(val1) > 0 and len(val2) > 0:
                             paired_data1.append(val1.iloc[0])
                             paired_data2.append(val2.iloc[0])
-                    if len(paired_data1) >= 3:
+                    if len(paired_data1) >= MIN_CELLS_PER_UNIT:
                         t_result = pg.ttest(np.array(paired_data1), np.array(paired_data2), paired=True)
                         posthoc_p = t_result['p-val'].values[0]
                         result[f'{cond1}_vs_{cond2}_posthoc_p'] = posthoc_p
@@ -1007,7 +1009,7 @@ class AttenuationAnalyzerDependent:
                         data2 = subset[subset['Within_Factor'] == wlevel2].set_index('Subject_ID')['Peak_Voltage']
                         
                         common_subjects = data1.index.intersection(data2.index)
-                        if len(common_subjects) < 3:
+                        if len(common_subjects) < MIN_CELLS_PER_UNIT:
                             continue
                         
                         data1_paired = data1.loc[common_subjects]
@@ -1042,7 +1044,7 @@ class AttenuationAnalyzerDependent:
                         data1 = subset[subset['Between_Factor'] == blevel1]['Peak_Voltage']
                         data2 = subset[subset['Between_Factor'] == blevel2]['Peak_Voltage']
                         
-                        if len(data1) < 2 or len(data2) < 2:
+                        if len(data1) < MIN_CELLS_PER_UNIT or len(data2) < MIN_CELLS_PER_UNIT:
                             continue
                         
                         t_result = pg.ttest(data1, data2, paired=False)
@@ -1129,7 +1131,7 @@ class AttenuationAnalyzerDependent:
         for blevel1, blevel2 in combinations(between_levels, 2):
             data1 = subject_means[subject_means['Between_Factor'] == blevel1]['Peak_Voltage']
             data2 = subject_means[subject_means['Between_Factor'] == blevel2]['Peak_Voltage']
-            if len(data1) < 2 or len(data2) < 2:
+            if len(data1) < MIN_CELLS_PER_UNIT or len(data2) < MIN_CELLS_PER_UNIT:
                 continue
             try:
                 t_result = pg.ttest(data1, data2, paired=False)
