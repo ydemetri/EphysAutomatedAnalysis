@@ -386,8 +386,8 @@ class PlotGenerator:
                               color="black", capsize=10, markersize=50, 
                               markeredgewidth=6, zorder=5)
             
-            # Set axis properties
-            if column not in ['AP Threshold (mV)', 'Vm (mV)', "Velocity Downstroke (mV_per_ms)"]:
+            # Set axis properties (leave Burst_length auto-scaled)
+            if column not in ['AP Threshold (mV)', 'Vm (mV)','Burst_length (ms)']:
                 # Get the y-axis range to calculate margin
                 current_ylim = ax.get_ylim()
                 y_range = current_ylim[1] - current_ylim[0]

@@ -210,7 +210,8 @@ class OneWayANOVA:
         logger.info(f"Running post-hoc pairwise comparisons for {len(significant_measurements)} significant measurements")
         
         pairwise_results = []
-        group_names = [g.name for g in groups if g.name in group_data]
+        # Use available group_data keys to avoid order/sync issues from UI selection
+        group_names = sorted(group_data.keys())
         
         for measurement in significant_measurements:
             # Look up which omnibus test was used for this measurement
