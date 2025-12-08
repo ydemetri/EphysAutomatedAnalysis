@@ -125,6 +125,7 @@ class OneWayANOVA:
         # Extract data for all groups, dropping NaN values
         group_arrays = []
         group_stats = {}
+        records = []
         
         for group in groups:
             if group.name in group_data:
@@ -136,14 +137,20 @@ class OneWayANOVA:
                         'stderr': data.std(ddof=1) / math.sqrt(len(data)),
                         'n': len(data)
                     }
+                    records.extend([(val, group.name) for val in data])
         
         # Check if we have sufficient data
         if len(group_arrays) < 3:
             logger.warning(f"Insufficient groups with data for {column}: {len(group_arrays)}")
             return None
         
-        # Decide parametric vs nonparametric using skewness/kurtosis
-        use_parametric = should_use_parametric(group_arrays)
+        # Decide parametric vs nonparametric using residuals (values centered by group)
+        if not records:
+            return None
+        df_records = pd.DataFrame(records, columns=['value', 'group'])
+        group_means = df_records.groupby('group')['value'].mean()
+        residuals = df_records['value'] - df_records['group'].map(group_means)
+        use_parametric = should_use_parametric([residuals.values])
             
         # Run test
         try:

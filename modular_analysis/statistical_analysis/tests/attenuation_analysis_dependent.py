@@ -28,6 +28,9 @@ logger = logging.getLogger(__name__)
 MIN_CELLS_PER_UNIT = 3
 MIN_SUBJECTS = 10
 
+def _valid_p(val: float) -> bool:
+    return val is not None and np.isfinite(val)
+
 
 def _pair_subject_value_columns(df: pd.DataFrame) -> List[Tuple[str, str]]:
     subject_cols = [col for col in df.columns if col.startswith('Subject_')]
@@ -307,10 +310,6 @@ class AttenuationAnalyzerDependent:
                 
             except Exception as e:
                 logger.warning(f"Error in paired t-test at AP {ap_idx + 1}: {e}")
-        
-        def _valid_p(val: float) -> bool:
-            return val is not None and np.isfinite(val)
-        
         # Apply FDR correction (handling NaN p-values)
         if len(results) > 1:
             # Extract p-values and track valid indices
@@ -561,12 +560,13 @@ class AttenuationAnalyzerDependent:
             
             df_long = pd.DataFrame(long_data)
             
-            # Decide parametric vs nonparametric using skewness/kurtosis
-            condition_arrays = []
-            for condition in within_levels:
-                cond_vals = df_long[df_long['Condition'] == condition]['Peak'].values
-                condition_arrays.append(cond_vals)
-            use_parametric = should_use_parametric(condition_arrays)
+            # Decide parametric vs nonparametric using residuals (value minus subject mean)
+            subject_means = (
+                df_long.groupby('Subject_ID')['Peak'].mean().rename('SubjectMean')
+            )
+            df_long = df_long.merge(subject_means, left_on='Subject_ID', right_index=True, how='left')
+            residuals = (df_long['Peak'] - df_long['SubjectMean']).values
+            use_parametric = should_use_parametric([residuals])
             
             try:
                 if use_parametric:
@@ -1209,9 +1209,6 @@ class AttenuationAnalyzerDependent:
         if not posthoc_results:
             return posthoc_results
         
-        def _valid_p(val: float) -> bool:
-            return val is not None and np.isfinite(val)
-        
         # Group post-hoc results by AP number (each ANOVA family)
         ap_groups = {}
         for result in posthoc_results:
@@ -1294,9 +1291,6 @@ class AttenuationAnalyzerDependent:
     
     def _apply_fdr_to_results(self, results: List[Dict]) -> List[Dict]:
         """Apply FDR correction separately for each effect type."""
-        
-        def _valid_p(val: float) -> bool:
-            return val is not None and np.isfinite(val)
         
         effect_types = ['between_p', 'within_p', 'interaction_p']
         

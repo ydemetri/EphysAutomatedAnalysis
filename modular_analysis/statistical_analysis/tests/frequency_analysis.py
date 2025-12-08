@@ -579,8 +579,15 @@ class FrequencyAnalyzer:
             # Preserve original ordering for ANOVA input
             group_data_lists = [group_step_values[name] for name in group_names]
             
-            # Decide parametric vs nonparametric using skewness/kurtosis
-            use_parametric = should_use_parametric(group_data_lists)
+            # Decide parametric vs nonparametric using residuals (values centered by group)
+            records = []
+            for gname in group_names:
+                vals = group_step_values[gname]
+                records.extend([(v, gname) for v in vals])
+            df_records = pd.DataFrame(records, columns=['value', 'group'])
+            group_means = df_records.groupby('group')['value'].mean()
+            residuals = df_records['value'] - df_records['group'].map(group_means)
+            use_parametric = should_use_parametric([residuals.values])
             
             # Run ANOVA (one-way or two-way depending on design)
             try:

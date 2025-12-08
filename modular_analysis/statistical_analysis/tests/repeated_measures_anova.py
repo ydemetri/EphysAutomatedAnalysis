@@ -179,12 +179,14 @@ class RepeatedMeasuresANOVA:
             logger.warning(f"Insufficient subjects per condition for {column}")
             return None
         
-        # Decide parametric vs nonparametric using skewness/kurtosis
-        condition_arrays = []
-        for condition in conditions:
-            cond_vals = df_long[df_long['Condition'] == condition]['Value'].values
-            condition_arrays.append(cond_vals)
-        use_parametric = should_use_parametric(condition_arrays)
+        # Decide parametric vs nonparametric using residuals (standard check for RM ANOVA)
+        # Residuals = value minus each subject's mean across conditions
+        subject_means = (
+            df_long.groupby('Subject_ID')['Value'].mean().rename('SubjectMean')
+        )
+        df_long = df_long.merge(subject_means, left_on='Subject_ID', right_index=True, how='left')
+        residuals = (df_long['Value'] - df_long['SubjectMean']).values
+        use_parametric = should_use_parametric([residuals])
         
         # Run repeated measures test
         try:

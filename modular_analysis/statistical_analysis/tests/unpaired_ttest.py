@@ -121,8 +121,12 @@ class UnpairedTTest:
         se1 = data1.std(ddof=1) / math.sqrt(len(data1))
         se2 = data2.std(ddof=1) / math.sqrt(len(data2))
         
-        # Decide parametric vs nonparametric using skewness/kurtosis
-        use_parametric = should_use_parametric([data1.values, data2.values])
+        # Decide parametric vs nonparametric using residuals (values centered by group)
+        residuals = np.concatenate([
+            (data1.values - mean1),
+            (data2.values - mean2)
+        ])
+        use_parametric = should_use_parametric([residuals])
 
         try:
             if use_parametric:
