@@ -4,7 +4,7 @@ Unpaired t-test implementation for independent two-group comparisons.
 
 import pandas as pd
 import numpy as np
-from scipy.stats import ttest_ind
+from scipy.stats import ttest_ind, mannwhitneyu
 import math
 import logging
 import os
@@ -13,7 +13,7 @@ from typing import List, Dict, Tuple, Optional
 import statsmodels.stats.multitest as multi
 
 from ...shared.data_models import ExperimentalDesign, StatisticalResult, DataContainer
-from ...shared.utils import clean_dataframe, categorize_measurement, get_measurement_categories
+from ...shared.utils import clean_dataframe, categorize_measurement, get_measurement_categories, should_use_parametric
 
 logger = logging.getLogger(__name__)
 
@@ -118,15 +118,21 @@ class UnpairedTTest:
         # Calculate descriptive statistics
         mean1 = data1.mean()
         mean2 = data2.mean()
-        se1 = data1.std() / math.sqrt(len(data1))
-        se2 = data2.std() / math.sqrt(len(data2))
+        se1 = data1.std(ddof=1) / math.sqrt(len(data1))
+        se2 = data2.std(ddof=1) / math.sqrt(len(data2))
         
-        # Run Welch's t-test (equal_var=False)
+        # Decide parametric vs nonparametric using skewness/kurtosis
+        use_parametric = should_use_parametric([data1.values, data2.values])
+
         try:
-            t_stat, p_value = ttest_ind(data1, data2, nan_policy="omit", equal_var=False)
+            if use_parametric:
+                t_stat, p_value = ttest_ind(data1, data2, nan_policy="omit", equal_var=False)
+            else:
+                mw = mannwhitneyu(data1, data2, alternative="two-sided")
+                p_value = mw.pvalue
             
             return StatisticalResult(
-                test_name=self.name,
+                test_name=self.name if use_parametric else "Mann-Whitney U",
                 measurement=column,
                 group1_name=group1_name,
                 group1_mean=mean1,
@@ -209,6 +215,7 @@ class UnpairedTTest:
             row = {
                 "Measurement": result.measurement,
                 "MeasurementType": result.measurement_type,
+                "Test_Type": result.test_name,
                 f"{result.group1_name}_mean": result.group1_mean,
                 f"{result.group1_name}_stderr": result.group1_stderr,
                 f"{result.group1_name}_n": result.group1_n,
@@ -222,8 +229,8 @@ class UnpairedTTest:
             
         df = pd.DataFrame(data)
         
-        # Explicitly set column order: descriptive stats first, then p-values last
-        base_columns = ["Measurement", "MeasurementType"]
+        # Explicitly set column order: base info, test type, then group stats, then p-values
+        base_columns = ["Measurement", "MeasurementType", "Test_Type"]
         group_columns = []
         p_value_columns = ["p-value", "corrected_p"]
         

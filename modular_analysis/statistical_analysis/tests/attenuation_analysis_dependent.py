@@ -13,8 +13,10 @@ from itertools import combinations
 import statsmodels.stats.multitest as multi
 import statsmodels.formula.api as smf
 import pingouin as pg
+from scipy.stats import wilcoxon, friedmanchisquare
 
 from ...shared.data_models import ExperimentalDesign
+from ...shared.utils import should_use_parametric
 from .posthoc_utils import (
     should_run_posthocs,
     get_simple_effect_comparisons_dependent,
@@ -24,6 +26,7 @@ from .posthoc_utils import (
 logger = logging.getLogger(__name__)
 
 MIN_CELLS_PER_UNIT = 3
+MIN_SUBJECTS = 10
 
 
 def _pair_subject_value_columns(df: pd.DataFrame) -> List[Tuple[str, str]]:
@@ -271,24 +274,33 @@ class AttenuationAnalyzerDependent:
                         data1_list.append(val1)
                         data2_list.append(val2)
             
-            if len(data1_list) < MIN_CELLS_PER_UNIT:
+            if len(data1_list) < MIN_SUBJECTS:
                 continue
             
-            # Run paired t-test
+            # Choose paired t vs Wilcoxon based on skewness/kurtosis of differences
+            diffs = np.array(data1_list) - np.array(data2_list)
+            use_parametric = should_use_parametric([diffs])
+            
             try:
                 data1_arr = np.array(data1_list)
                 data2_arr = np.array(data2_list)
                 
-                t_result = pg.ttest(data1_arr, data2_arr, paired=True)
-                p_value = t_result['p-val'].values[0]
+                if use_parametric:
+                    t_result = pg.ttest(data1_arr, data2_arr, paired=True)
+                    p_value = t_result['p-val'].values[0]
+                    test_label = "Paired t-test"
+                else:
+                    w_stat, p_value = wilcoxon(data1_arr, data2_arr, zero_method="wilcox", alternative="two-sided")
+                    test_label = "Wilcoxon signed-rank"
                 
                 results.append({
                     'ap_number': ap_idx + 1,  # 1-indexed
+                    'Test': test_label,
                     f'{cond1_name}_mean': data1_arr.mean(),
-                    f'{cond1_name}_SEM': data1_arr.std() / np.sqrt(len(data1_arr)),
+                    f'{cond1_name}_SEM': data1_arr.std(ddof=1) / np.sqrt(len(data1_arr)),
                     f'{cond1_name}_n': len(data1_arr),
                     f'{cond2_name}_mean': data2_arr.mean(),
-                    f'{cond2_name}_SEM': data2_arr.std() / np.sqrt(len(data2_arr)),
+                    f'{cond2_name}_SEM': data2_arr.std(ddof=1) / np.sqrt(len(data2_arr)),
                     f'{cond2_name}_n': len(data2_arr),
                     'p_value': p_value
                 })
@@ -296,10 +308,13 @@ class AttenuationAnalyzerDependent:
             except Exception as e:
                 logger.warning(f"Error in paired t-test at AP {ap_idx + 1}: {e}")
         
+        def _valid_p(val: float) -> bool:
+            return val is not None and np.isfinite(val)
+        
         # Apply FDR correction (handling NaN p-values)
         if len(results) > 1:
             # Extract p-values and track valid indices
-            valid_indices = [i for i, r in enumerate(results) if not np.isnan(r['p_value'])]
+            valid_indices = [i for i, r in enumerate(results) if _valid_p(r['p_value'])]
             valid_p_values = [results[i]['p_value'] for i in valid_indices]
             
             if len(valid_p_values) > 1:
@@ -329,7 +344,7 @@ class AttenuationAnalyzerDependent:
             # Single result - copy raw p-value if valid
             for result in results:
                 result['corrected_p'] = (
-                    result['p_value'] if not np.isnan(result['p_value']) else np.nan
+                    result['p_value'] if _valid_p(result['p_value']) else np.nan
                 )
         
         return results
@@ -546,44 +561,73 @@ class AttenuationAnalyzerDependent:
             
             df_long = pd.DataFrame(long_data)
             
-            # Run RM-ANOVA using pingouin
+            # Decide parametric vs nonparametric using skewness/kurtosis
+            condition_arrays = []
+            for condition in within_levels:
+                cond_vals = df_long[df_long['Condition'] == condition]['Peak'].values
+                condition_arrays.append(cond_vals)
+            use_parametric = should_use_parametric(condition_arrays)
+            
             try:
-                aov = pg.rm_anova(
-                    dv='Peak',
-                    within='Condition',
-                    subject='Subject_ID',
-                    data=df_long
-                )
-                
-                p_value = aov['p-unc'].values[0]
+                if use_parametric:
+                    aov = pg.rm_anova(
+                        dv='Peak',
+                        within='Condition',
+                        subject='Subject_ID',
+                        data=df_long
+                    )
+                    p_value = aov['p-unc'].values[0]
+                    test_label = "RM_ANOVA"
+                else:
+                    pivot = df_long.pivot(index='Subject_ID', columns='Condition', values='Peak').dropna()
+                    if pivot.shape[0] < 2:
+                        p_value = np.nan
+                        test_label = "Friedman"
+                    else:
+                        stat, p_value = friedmanchisquare(*[pivot[c].values for c in pivot.columns])
+                        test_label = "Friedman"
                 
                 # Calculate group statistics
                 result = {
                     'ap_number': ap_idx + 1,
-                    'rm_anova_p': p_value
+                    'rm_anova_p': p_value,
+                    'Test': test_label
                 }
                 
                 # Add statistics for each condition
                 for condition in within_levels:
                     cond_data = df_long[df_long['Condition'] == condition]['Peak']
                     result[f'{condition}_mean'] = cond_data.mean()
-                    result[f'{condition}_SEM'] = cond_data.std() / np.sqrt(len(cond_data)) if len(cond_data) > 1 else 0
+                    result[f'{condition}_SEM'] = cond_data.std(ddof=1) / np.sqrt(len(cond_data)) if len(cond_data) > 1 else 0
                     result[f'{condition}_n'] = len(cond_data)
                 
-                results.append(result)
-                ap_frames[ap_idx + 1] = df_long.copy()
+                if not np.isnan(p_value):
+                    results.append(result)
+                    ap_frames[ap_idx + 1] = df_long.copy()
                 
             except Exception as e:
-                logger.warning(f"Error in RM-ANOVA at AP {ap_idx + 1}: {e}")
+                logger.warning(f"Error in RM-ANOVA/Friedman at AP {ap_idx + 1}: {e}")
         
-        # Apply FDR correction to RM-ANOVA p-values
+        # Apply FDR correction to RM-ANOVA/Friedman p-values
         if len(results) > 1:
-            p_values = [r['rm_anova_p'] for r in results]
+            p_values = [r['rm_anova_p'] for r in results if _valid_p(r.get('rm_anova_p'))]
             try:
-                _, corrected_p, _, _ = multi.multipletests(p_values, method="fdr_bh")
-                for i, result in enumerate(results):
-                    result['rm_anova_corrected_p'] = corrected_p[i]
-                logger.info(f"Applied FDR correction to {len(p_values)} RM-ANOVA tests")
+                if len(p_values) > 1:
+                    _, corrected_p, _, _ = multi.multipletests(p_values, method="fdr_bh")
+                    idx = 0
+                    for result in results:
+                        if _valid_p(result.get('rm_anova_p')):
+                            result['rm_anova_corrected_p'] = corrected_p[idx]
+                            idx += 1
+                        else:
+                            result['rm_anova_corrected_p'] = np.nan
+                    logger.info(f"Applied FDR correction to {len(p_values)} RM-ANOVA/Friedman tests")
+                else:
+                    for result in results:
+                        if _valid_p(result.get('rm_anova_p')):
+                            result['rm_anova_corrected_p'] = result['rm_anova_p']
+                        else:
+                            result['rm_anova_corrected_p'] = np.nan
             except Exception as e:
                 logger.error(f"Error applying FDR correction: {e}")
                 for result in results:
@@ -598,7 +642,8 @@ class AttenuationAnalyzerDependent:
             df_long = ap_frames.get(ap_number)
             if df_long is None:
                 continue
-            logger.info(f"RM-ANOVA significant at AP {ap_number} (corrected p = {corrected:.4f}) - running post-hoc tests")
+            logger.info(f"RM-ANOVA/Friedman significant at AP {ap_number} (corrected p = {corrected:.4f}) - running post-hoc tests")
+            is_nonparam = result.get('Test') == 'Friedman'
             for cond1, cond2 in combinations(within_levels, 2):
                 try:
                     paired_data1 = []
@@ -611,8 +656,16 @@ class AttenuationAnalyzerDependent:
                             paired_data1.append(val1.iloc[0])
                             paired_data2.append(val2.iloc[0])
                     if len(paired_data1) >= MIN_CELLS_PER_UNIT:
-                        t_result = pg.ttest(np.array(paired_data1), np.array(paired_data2), paired=True)
-                        posthoc_p = t_result['p-val'].values[0]
+                        if is_nonparam:
+                            w_stat, posthoc_p = wilcoxon(
+                                np.array(paired_data1),
+                                np.array(paired_data2),
+                                zero_method="wilcox",
+                                alternative="two-sided"
+                            )
+                        else:
+                            t_result = pg.ttest(np.array(paired_data1), np.array(paired_data2), paired=True)
+                            posthoc_p = t_result['p-val'].values[0]
                         result[f'{cond1}_vs_{cond2}_posthoc_p'] = posthoc_p
                 except Exception as e:
                     logger.warning(f"Error in post-hoc test at AP {ap_number} ({cond1} vs {cond2}): {e}")
@@ -873,7 +926,7 @@ class AttenuationAnalyzerDependent:
                 for (between_level, within_level), group_df in df_ap.groupby(['Between_Factor', 'Within_Factor']):
                     group_name = f"{between_level}: {within_level}"
                     result[f'{group_name}_mean'] = group_df['Peak_Voltage'].mean()
-                    result[f'{group_name}_SEM'] = group_df['Peak_Voltage'].std() / np.sqrt(len(group_df))
+                    result[f'{group_name}_SEM'] = group_df['Peak_Voltage'].std(ddof=1) / np.sqrt(len(group_df))
                     result[f'{group_name}_n'] = len(group_df)
                 
                 anova_results.append(result)
@@ -1023,13 +1076,12 @@ class AttenuationAnalyzerDependent:
                             'Comparison': f"{between_level}: {wlevel1} vs {wlevel2}",
                             'Group1': f"{between_level}: {wlevel1}",
                             'Group1_mean': data1_paired.mean(),
-                            'Group1_stderr': data1_paired.std() / np.sqrt(len(data1_paired)),
+                            'Group1_stderr': data1_paired.std(ddof=1) / np.sqrt(len(data1_paired)),
                             'Group1_n': len(common_subjects),
                             'Group2': f"{between_level}: {wlevel2}",
                             'Group2_mean': data2_paired.mean(),
-                            'Group2_stderr': data2_paired.std() / np.sqrt(len(data2_paired)),
+                            'Group2_stderr': data2_paired.std(ddof=1) / np.sqrt(len(data2_paired)),
                             'Group2_n': len(common_subjects),
-                            't_statistic': t_result['T'].values[0],
                             'p_value': t_result['p-val'].values[0]
                         })
                     except Exception as e:
@@ -1055,13 +1107,12 @@ class AttenuationAnalyzerDependent:
                             'Comparison': f"{within_level}: {blevel1} vs {blevel2}",
                             'Group1': f"{within_level}: {blevel1}",
                             'Group1_mean': data1.mean(),
-                            'Group1_stderr': data1.std() / np.sqrt(len(data1)),
+                            'Group1_stderr': data1.std(ddof=1) / np.sqrt(len(data1)),
                             'Group1_n': len(data1),
                             'Group2': f"{within_level}: {blevel2}",
                             'Group2_mean': data2.mean(),
-                            'Group2_stderr': data2.std() / np.sqrt(len(data2)),
+                            'Group2_stderr': data2.std(ddof=1) / np.sqrt(len(data2)),
                             'Group2_n': len(data2),
-                            't_statistic': t_result['T'].values[0],
                             'p_value': t_result['p-val'].values[0]
                         })
                     except Exception as e:
@@ -1108,7 +1159,6 @@ class AttenuationAnalyzerDependent:
                     'Group2_mean': paired[wlevel2].mean(),
                     'Group2_stderr': paired[wlevel2].std(ddof=1) / np.sqrt(len(paired)) if len(paired) > 1 else 0.0,
                     'Group2_n': len(paired),
-                    't_statistic': t_result['T'].values[0],
                     'p_value': t_result['p-val'].values[0]
                 })
             except Exception as e:
@@ -1147,7 +1197,6 @@ class AttenuationAnalyzerDependent:
                     'Group2_mean': data2.mean(),
                     'Group2_stderr': data2.std(ddof=1) / np.sqrt(len(data2)) if len(data2) > 1 else 0.0,
                     'Group2_n': len(data2),
-                    't_statistic': t_result['T'].values[0],
                     'p_value': t_result['p-val'].values[0]
                 })
             except Exception as e:
@@ -1159,6 +1208,9 @@ class AttenuationAnalyzerDependent:
         
         if not posthoc_results:
             return posthoc_results
+        
+        def _valid_p(val: float) -> bool:
+            return val is not None and np.isfinite(val)
         
         # Group post-hoc results by AP number (each ANOVA family)
         ap_groups = {}
@@ -1172,8 +1224,8 @@ class AttenuationAnalyzerDependent:
         for ap_num, results_list in ap_groups.items():
             if len(results_list) > 1:
                 # Extract p-values (filter out NaN)
-                p_values = [r['p_value'] for r in results_list if not np.isnan(r['p_value'])]
-                valid_indices = [i for i, r in enumerate(results_list) if not np.isnan(r['p_value'])]
+                p_values = [r['p_value'] for r in results_list if _valid_p(r['p_value'])]
+                valid_indices = [i for i, r in enumerate(results_list) if _valid_p(r['p_value'])]
                 
                 if len(p_values) > 1:
                     try:
@@ -1243,11 +1295,14 @@ class AttenuationAnalyzerDependent:
     def _apply_fdr_to_results(self, results: List[Dict]) -> List[Dict]:
         """Apply FDR correction separately for each effect type."""
         
+        def _valid_p(val: float) -> bool:
+            return val is not None and np.isfinite(val)
+        
         effect_types = ['between_p', 'within_p', 'interaction_p']
         
         for effect_type in effect_types:
-            p_values = [r[effect_type] for r in results if not np.isnan(r[effect_type])]
-            valid_indices = [i for i, r in enumerate(results) if not np.isnan(r[effect_type])]
+            p_values = [r[effect_type] for r in results if _valid_p(r.get(effect_type))]
+            valid_indices = [i for i, r in enumerate(results) if _valid_p(r.get(effect_type))]
             
             if len(p_values) > 1:
                 try:
@@ -1288,7 +1343,7 @@ class AttenuationAnalyzerDependent:
                 # Base row data
                 row = {
                     'AP_Number': ap_num,
-                    'Test_Type': 'Mixed ANOVA'
+                    'Test_Type': result.get('Test', 'Mixed ANOVA')
                 }
                 
                 # Add effect p-values
@@ -1318,7 +1373,7 @@ class AttenuationAnalyzerDependent:
             
             # Reorder columns to ensure correct order (matching Stats_parameters structure)
             # Order: AP_Number -> Group stats -> ANOVA effects
-            base_cols = ['AP_Number']
+            base_cols = ['AP_Number', 'Test_Type']
             
             # Extract group names and sort them, then add mean, SEM, n for each group in that order
             group_names_set = set()
@@ -1372,7 +1427,7 @@ class AttenuationAnalyzerDependent:
             base_cols = ['ap_number', 'Test_Type', 'Comparison']
             group_cols = ['Group1', 'Group1_mean', 'Group1_stderr', 'Group1_n',
                          'Group2', 'Group2_mean', 'Group2_stderr', 'Group2_n']
-            stat_cols = ['t_statistic', 'p_value']
+            stat_cols = ['p_value']
             if 'corrected_p' in df.columns:
                 stat_cols.append('corrected_p')
             

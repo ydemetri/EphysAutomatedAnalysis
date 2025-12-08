@@ -5,6 +5,7 @@ Utility functions for the analysis system.
 import os
 import pandas as pd
 import numpy as np
+from scipy.stats import skew, kurtosis
 from typing import List, Dict, Optional, Tuple
 import logging
 
@@ -130,6 +131,60 @@ def categorize_measurement(measurement: str) -> str:
     
     # Default category if not found
     return "Other"
+
+
+# Constants for parametric/nonparametric decision
+# Based on Curran, West & Finch (1996) thresholds
+MIN_N_PARAMETRIC = 10  # Below this, use non-parametric (can't assess assumptions reliably)
+SKEW_THRESHOLD = 2.0   # |skewness| > 2 indicates severe non-normality
+KURT_THRESHOLD = 7.0   # |kurtosis| > 7 indicates severe non-normality
+
+
+def should_use_parametric(data_arrays: List[np.ndarray]) -> bool:
+    """
+    Decide whether to use parametric or non-parametric tests based on
+    sample size and distribution shape (skewness/kurtosis).
+    
+    This replaces Shapiro-Wilk testing, which is problematic because:
+    - Overpowered for large samples (rejects normality for trivial deviations)
+    - Underpowered for small samples (can't detect non-normality)
+    
+    Decision logic:
+    1. If any group has n < MIN_N_PARAMETRIC: use non-parametric
+    2. If any group has |skewness| > 2 or |kurtosis| > 7: use non-parametric
+    3. Otherwise: use parametric (with Welch correction for unequal variances)
+    
+    Thresholds based on Curran, West & Finch (1996) guidelines.
+    
+    Args:
+        data_arrays: List of numpy arrays, one per group
+        
+    Returns:
+        True if parametric tests should be used, False for non-parametric
+    """
+    for arr in data_arrays:
+        # Convert to numpy array if needed
+        arr = np.asarray(arr)
+        arr = arr[~np.isnan(arr)]  # Remove NaN values
+        
+        # Small samples: can't reliably assess assumptions
+        if len(arr) < MIN_N_PARAMETRIC:
+            return False
+        
+        # Check distribution shape (need at least 3 values for skew/kurtosis)
+        if len(arr) >= 3:
+            try:
+                arr_skew = abs(skew(arr))
+                arr_kurt = abs(kurtosis(arr))  # excess kurtosis (normal = 0)
+                
+                # Severe violations: use non-parametric
+                if arr_skew > SKEW_THRESHOLD or arr_kurt > KURT_THRESHOLD:
+                    return False
+            except Exception:
+                # If calculation fails, be conservative
+                return False
+    
+    return True
 
 
 def create_output_paths(base_path: str, group_names: List[str]) -> Dict[str, Dict[str, str]]:

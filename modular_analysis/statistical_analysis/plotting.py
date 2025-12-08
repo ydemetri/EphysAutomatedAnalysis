@@ -381,7 +381,7 @@ class PlotGenerator:
                 
                 if len(group_data) > 0:
                     mean_val = group_data.mean()
-                    se_val = group_data.std() / np.sqrt(len(group_data))
+                    se_val = group_data.std(ddof=1) / np.sqrt(len(group_data))
                     ax.errorbar(formatted_name, mean_val, yerr=se_val, fmt="_", 
                               color="black", capsize=10, markersize=50, 
                               markeredgewidth=6, zorder=5)

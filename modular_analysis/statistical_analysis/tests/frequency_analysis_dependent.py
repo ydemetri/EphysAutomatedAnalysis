@@ -13,8 +13,10 @@ from itertools import combinations
 import statsmodels.stats.multitest as multi
 import statsmodels.formula.api as smf
 import pingouin as pg
+from scipy.stats import wilcoxon, friedmanchisquare
 
 from ...shared.data_models import ExperimentalDesign, StatisticalResult
+from ...shared.utils import should_use_parametric
 from .posthoc_utils import (
     should_run_posthocs,
     get_simple_effect_comparisons_dependent,
@@ -24,6 +26,7 @@ from .posthoc_utils import (
 logger = logging.getLogger(__name__)
 
 MIN_CELLS_PER_UNIT = 3
+MIN_SUBJECTS = 10
 
 
 def _pair_subject_value_columns(df: pd.DataFrame) -> List[Tuple[str, str]]:
@@ -76,6 +79,8 @@ def _get_effect_pvalue(model, param_names: list, data: pd.DataFrame, formula: st
 
 class FrequencyAnalyzerDependent:
     """Frequency analyzer for dependent designs using mixed models."""
+    
+    MIN_SUBJECTS = 10
     
     def __init__(self, protocol_config=None):
         self.name = "Frequency Analyzer (Dependent)"
@@ -259,24 +264,33 @@ class FrequencyAnalyzerDependent:
                             data2_list.append(val2)
                             subjects.append(subject_col)
                 
-                if len(data1_list) < MIN_CELLS_PER_UNIT:
+                if len(data1_list) < MIN_SUBJECTS:
                     continue
                 
-                # Run paired t-test
+                # Choose paired t vs Wilcoxon based on skewness/kurtosis of differences
+                diffs = np.array(data1_list) - np.array(data2_list)
+                use_parametric = should_use_parametric([diffs])
+                
                 try:
                     data1_arr = np.array(data1_list)
                     data2_arr = np.array(data2_list)
                     
-                    t_result = pg.ttest(data1_arr, data2_arr, paired=True)
-                    p_value = t_result['p-val'].values[0]
+                    if use_parametric:
+                        t_result = pg.ttest(data1_arr, data2_arr, paired=True)
+                        p_value = t_result['p-val'].values[0]
+                        test_label = "Paired t-test"
+                    else:
+                        w_stat, p_value = wilcoxon(data1_arr, data2_arr, zero_method="wilcox", alternative="two-sided")
+                        test_label = "Wilcoxon signed-rank"
                     
                     results.append({
                         'current_step': step_value,
+                        'Test': test_label,
                         f'{cond1_name}_mean': data1_arr.mean(),
-                        f'{cond1_name}_SEM': data1_arr.std() / np.sqrt(len(data1_arr)),
+                        f'{cond1_name}_SEM': data1_arr.std(ddof=1) / np.sqrt(len(data1_arr)),
                         f'{cond1_name}_n': len(data1_arr),
                         f'{cond2_name}_mean': data2_arr.mean(),
-                        f'{cond2_name}_SEM': data2_arr.std() / np.sqrt(len(data2_arr)),
+                        f'{cond2_name}_SEM': data2_arr.std(ddof=1) / np.sqrt(len(data2_arr)),
                         f'{cond2_name}_n': len(data2_arr),
                         'p_value': p_value
                     })
@@ -314,24 +328,33 @@ class FrequencyAnalyzerDependent:
                                 data1_list.append(val1)
                                 data2_list.append(val2)
                 
-                if len(data1_list) < MIN_CELLS_PER_UNIT:
+                if len(data1_list) < MIN_SUBJECTS:
                     continue
                 
-                # Run paired t-test
+                # Choose paired t vs Wilcoxon based on skewness/kurtosis of differences
+                diffs = np.array(data1_list) - np.array(data2_list)
+                use_parametric = should_use_parametric([diffs])
+                
                 try:
                     data1_arr = np.array(data1_list)
                     data2_arr = np.array(data2_list)
                     
-                    t_result = pg.ttest(data1_arr, data2_arr, paired=True)
-                    p_value = t_result['p-val'].values[0]
+                    if use_parametric:
+                        t_result = pg.ttest(data1_arr, data2_arr, paired=True)
+                        p_value = t_result['p-val'].values[0]
+                        test_label = "Paired t-test"
+                    else:
+                        w_stat, p_value = wilcoxon(data1_arr, data2_arr, zero_method="wilcox", alternative="two-sided")
+                        test_label = "Wilcoxon signed-rank"
                     
                     results.append({
                         'fold_step': fold_value,
+                        'Test': test_label,
                         f'{cond1_name}_mean': data1_arr.mean(),
-                        f'{cond1_name}_SEM': data1_arr.std() / np.sqrt(len(data1_arr)),
+                        f'{cond1_name}_SEM': data1_arr.std(ddof=1) / np.sqrt(len(data1_arr)),
                         f'{cond1_name}_n': len(data1_arr),
                         f'{cond2_name}_mean': data2_arr.mean(),
-                        f'{cond2_name}_SEM': data2_arr.std() / np.sqrt(len(data2_arr)),
+                        f'{cond2_name}_SEM': data2_arr.std(ddof=1) / np.sqrt(len(data2_arr)),
                         f'{cond2_name}_n': len(data2_arr),
                         'p_value': p_value
                     })
@@ -653,35 +676,55 @@ class FrequencyAnalyzerDependent:
                 
                 df_long = pd.DataFrame(long_data)
                 
-                # Run RM-ANOVA using pingouin
-                try:
+            # Decide parametric vs nonparametric
+            min_n = subjects_per_condition.min()
+            
+            # Decide parametric vs nonparametric using skewness/kurtosis
+            condition_arrays = []
+            for condition in within_levels:
+                cond_vals = df_long[df_long['Condition'] == condition]['Frequency'].values
+                condition_arrays.append(cond_vals)
+            use_parametric = should_use_parametric(condition_arrays)
+            
+            try:
+                if use_parametric:
                     aov = pg.rm_anova(
                         dv='Frequency',
                         within='Condition',
                         subject='Subject_ID',
                         data=df_long
                     )
-                    
                     p_value = aov['p-unc'].values[0]
-                    
-                    # Calculate group statistics
-                    result = {
-                        'current_step': step_value,
-                        'rm_anova_p': p_value
-                    }
-                    
-                    # Add statistics for each condition
-                    for condition in within_levels:
-                        cond_data = df_long[df_long['Condition'] == condition]['Frequency']
-                        result[f'{condition}_mean'] = cond_data.mean()
-                        result[f'{condition}_SEM'] = cond_data.std() / np.sqrt(len(cond_data)) if len(cond_data) > 1 else 0
-                        result[f'{condition}_n'] = len(cond_data)
-                    
+                    test_label = "RM_ANOVA"
+                else:
+                    pivot = df_long.pivot(index='Subject_ID', columns='Condition', values='Frequency').dropna()
+                    if pivot.shape[0] < 2:
+                        p_value = np.nan
+                        test_label = "Friedman"
+                    else:
+                        stat, p_value = friedmanchisquare(*[pivot[c].values for c in pivot.columns])
+                        test_label = "Friedman"
+                
+                # Calculate group statistics
+                result = {
+                    'current_step': step_value,
+                    'rm_anova_p': p_value,
+                    'Test': test_label
+                }
+                
+                # Add statistics for each condition
+                for condition in within_levels:
+                    cond_data = df_long[df_long['Condition'] == condition]['Frequency']
+                    result[f'{condition}_mean'] = cond_data.mean()
+                    result[f'{condition}_SEM'] = cond_data.std(ddof=1) / np.sqrt(len(cond_data)) if len(cond_data) > 1 else 0
+                    result[f'{condition}_n'] = len(cond_data)
+                
+                if not np.isnan(p_value):
                     results.append(result)
                     step_frames[('current', step_value)] = df_long.copy()
-                    
-                except Exception as e:
-                    logger.warning(f"Error in RM-ANOVA at step {step_value}: {e}")
+                
+            except Exception as e:
+                logger.warning(f"Error in RM-ANOVA/Friedman at step {step_value}: {e}")
         
         else:  # fold_rheobase
             # Get all unique fold values across conditions
@@ -723,44 +766,73 @@ class FrequencyAnalyzerDependent:
                 
                 df_long = pd.DataFrame(long_data)
                 
-                # Run RM-ANOVA using pingouin
+                # Decide parametric vs nonparametric using skewness/kurtosis
+                condition_arrays = []
+                for condition in within_levels:
+                    cond_vals = df_long[df_long['Condition'] == condition]['Frequency'].values
+                    condition_arrays.append(cond_vals)
+                use_parametric = should_use_parametric(condition_arrays)
+                
                 try:
-                    aov = pg.rm_anova(
-                        dv='Frequency',
-                        within='Condition',
-                        subject='Subject_ID',
-                        data=df_long
-                    )
-                    
-                    p_value = aov['p-unc'].values[0]
+                    if use_parametric:
+                        aov = pg.rm_anova(
+                            dv='Frequency',
+                            within='Condition',
+                            subject='Subject_ID',
+                            data=df_long
+                        )
+                        p_value = aov['p-unc'].values[0]
+                        test_label = "RM_ANOVA"
+                    else:
+                        pivot = df_long.pivot(index='Subject_ID', columns='Condition', values='Frequency').dropna()
+                        if pivot.shape[0] < 2:
+                            p_value = np.nan
+                            test_label = "Friedman"
+                        else:
+                            stat, p_value = friedmanchisquare(*[pivot[c].values for c in pivot.columns])
+                            test_label = "Friedman"
                     
                     # Calculate group statistics
                     result = {
                         'fold_step': fold_value,
-                        'rm_anova_p': p_value
+                        'rm_anova_p': p_value,
+                        'Test': test_label
                     }
                     
                     # Add statistics for each condition
                     for condition in within_levels:
                         cond_data = df_long[df_long['Condition'] == condition]['Frequency']
                         result[f'{condition}_mean'] = cond_data.mean()
-                        result[f'{condition}_SEM'] = cond_data.std() / np.sqrt(len(cond_data)) if len(cond_data) > 1 else 0
+                        result[f'{condition}_SEM'] = cond_data.std(ddof=1) / np.sqrt(len(cond_data)) if len(cond_data) > 1 else 0
                         result[f'{condition}_n'] = len(cond_data)
                     
-                    results.append(result)
-                    step_frames[('fold', fold_value)] = df_long.copy()
+                    if not np.isnan(p_value):
+                        results.append(result)
+                        step_frames[('fold', fold_value)] = df_long.copy()
                     
                 except Exception as e:
-                    logger.warning(f"Error in RM-ANOVA at fold {fold_value}: {e}")
+                    logger.warning(f"Error in RM-ANOVA/Friedman at fold {fold_value}: {e}")
         
-        # Apply FDR correction to RM-ANOVA p-values
+        # Apply FDR correction to RM-ANOVA/Friedman p-values
         if len(results) > 1:
-            p_values = [r['rm_anova_p'] for r in results]
+            p_values = [r['rm_anova_p'] for r in results if _valid_p(r.get('rm_anova_p'))]
             try:
-                _, corrected_p, _, _ = multi.multipletests(p_values, method="fdr_bh")
-                for i, result in enumerate(results):
-                    result['rm_anova_corrected_p'] = corrected_p[i]
-                logger.info(f"Applied FDR correction to {len(p_values)} RM-ANOVA tests")
+                if len(p_values) > 1:
+                    _, corrected_p, _, _ = multi.multipletests(p_values, method="fdr_bh")
+                    idx = 0
+                    for result in results:
+                        if _valid_p(result.get('rm_anova_p')):
+                            result['rm_anova_corrected_p'] = corrected_p[idx]
+                            idx += 1
+                        else:
+                            result['rm_anova_corrected_p'] = np.nan
+                    logger.info(f"Applied FDR correction to {len(p_values)} RM-ANOVA/Friedman tests")
+                else:
+                    for result in results:
+                        if _valid_p(result.get('rm_anova_p')):
+                            result['rm_anova_corrected_p'] = result['rm_anova_p']
+                        else:
+                            result['rm_anova_corrected_p'] = np.nan
             except Exception as e:
                 logger.error(f"Error applying FDR correction: {e}")
                 for result in results:
@@ -777,7 +849,8 @@ class FrequencyAnalyzerDependent:
             df_long = step_frames.get(frame_key)
             if df_long is None:
                 continue
-            logger.info(f"RM-ANOVA significant at {step_key} {step_value} (corrected p = {corrected:.4f}) - running post-hoc tests")
+            logger.info(f"RM-ANOVA/Friedman significant at {step_key} {step_value} (corrected p = {corrected:.4f}) - running post-hoc tests")
+            is_nonparam = result.get('Test') == 'Friedman'
             for cond1, cond2 in combinations(within_levels, 2):
                 try:
                     paired_data1 = []
@@ -790,8 +863,16 @@ class FrequencyAnalyzerDependent:
                             paired_data1.append(val1.iloc[0])
                             paired_data2.append(val2.iloc[0])
                     if len(paired_data1) >= MIN_CELLS_PER_UNIT:
-                        t_result = pg.ttest(np.array(paired_data1), np.array(paired_data2), paired=True)
-                        posthoc_p = t_result['p-val'].values[0]
+                        if is_nonparam:
+                            w_stat, posthoc_p = wilcoxon(
+                                np.array(paired_data1),
+                                np.array(paired_data2),
+                                zero_method="wilcox",
+                                alternative="two-sided"
+                            )
+                        else:
+                            t_result = pg.ttest(np.array(paired_data1), np.array(paired_data2), paired=True)
+                            posthoc_p = t_result['p-val'].values[0]
                         result[f'{cond1}_vs_{cond2}_posthoc_p'] = posthoc_p
                 except Exception as e:
                     logger.warning(f"Error in post-hoc test at {step_key} {step_value} ({cond1} vs {cond2}): {e}")
@@ -1119,7 +1200,7 @@ class FrequencyAnalyzerDependent:
                     for (between_level, within_level), group_df in df_step.groupby(['Between_Factor', 'Within_Factor']):
                         group_name = f"{between_level}: {within_level}"
                         result[f'{group_name}_mean'] = group_df['Frequency'].mean()
-                        result[f'{group_name}_SEM'] = group_df['Frequency'].std() / np.sqrt(len(group_df))
+                        result[f'{group_name}_SEM'] = group_df['Frequency'].std(ddof=1) / np.sqrt(len(group_df))
                         result[f'{group_name}_n'] = len(group_df)
                     
                     anova_results.append(result)
@@ -1191,7 +1272,7 @@ class FrequencyAnalyzerDependent:
                     for (between_level, within_level), group_df in df_step.groupby(['Between_Factor', 'Within_Factor']):
                         group_name = f"{between_level}: {within_level}"
                         result[f'{group_name}_mean'] = group_df['Frequency'].mean()
-                        result[f'{group_name}_SEM'] = group_df['Frequency'].std() / np.sqrt(len(group_df))
+                        result[f'{group_name}_SEM'] = group_df['Frequency'].std(ddof=1) / np.sqrt(len(group_df))
                         result[f'{group_name}_n'] = len(group_df)
                     
                     anova_results.append(result)
@@ -1370,13 +1451,12 @@ class FrequencyAnalyzerDependent:
                             'Comparison': f"{between_level}: {wlevel1} vs {wlevel2}",
                             'Group1': f"{between_level}: {wlevel1}",
                             'Group1_mean': data1_paired.mean(),
-                            'Group1_stderr': data1_paired.std() / np.sqrt(len(data1_paired)),
+                            'Group1_stderr': data1_paired.std(ddof=1) / np.sqrt(len(data1_paired)),
                             'Group1_n': len(common_subjects),
                             'Group2': f"{between_level}: {wlevel2}",
                             'Group2_mean': data2_paired.mean(),
-                            'Group2_stderr': data2_paired.std() / np.sqrt(len(data2_paired)),
+                            'Group2_stderr': data2_paired.std(ddof=1) / np.sqrt(len(data2_paired)),
                             'Group2_n': len(common_subjects),
-                            't_statistic': t_result['T'].values[0],
                             'p_value': t_result['p-val'].values[0]
                         })
                     except Exception as e:
@@ -1402,13 +1482,12 @@ class FrequencyAnalyzerDependent:
                             'Comparison': f"{within_level}: {blevel1} vs {blevel2}",
                             'Group1': f"{within_level}: {blevel1}",
                             'Group1_mean': data1.mean(),
-                            'Group1_stderr': data1.std() / np.sqrt(len(data1)),
+                            'Group1_stderr': data1.std(ddof=1) / np.sqrt(len(data1)),
                             'Group1_n': len(data1),
                             'Group2': f"{within_level}: {blevel2}",
                             'Group2_mean': data2.mean(),
-                            'Group2_stderr': data2.std() / np.sqrt(len(data2)),
+                            'Group2_stderr': data2.std(ddof=1) / np.sqrt(len(data2)),
                             'Group2_n': len(data2),
-                            't_statistic': t_result['T'].values[0],
                             'p_value': t_result['p-val'].values[0]
                         })
                     except Exception as e:
@@ -1456,7 +1535,6 @@ class FrequencyAnalyzerDependent:
                     'Group2_mean': paired[wlevel2].mean(),
                     'Group2_stderr': paired[wlevel2].std(ddof=1) / np.sqrt(len(paired)) if len(paired) > 1 else 0.0,
                     'Group2_n': len(paired),
-                    't_statistic': t_result['T'].values[0],
                     'p_value': t_result['p-val'].values[0],
                     'measurement_type': measurement_type
                 })
@@ -1497,7 +1575,6 @@ class FrequencyAnalyzerDependent:
                     'Group2_mean': data2.mean(),
                     'Group2_stderr': data2.std(ddof=1) / np.sqrt(len(data2)) if len(data2) > 1 else 0.0,
                     'Group2_n': len(data2),
-                    't_statistic': t_result['T'].values[0],
                     'p_value': t_result['p-val'].values[0],
                     'measurement_type': measurement_type
                 })
@@ -1510,6 +1587,9 @@ class FrequencyAnalyzerDependent:
         
         if not posthoc_results:
             return posthoc_results
+        
+        def _valid_p(val: float) -> bool:
+            return val is not None and np.isfinite(val)
         
         # Group post-hoc results by step value (each ANOVA family)
         step_key = 'current_step' if 'current_step' in posthoc_results[0] else 'fold_step'
@@ -1524,8 +1604,8 @@ class FrequencyAnalyzerDependent:
         for step_value, results_list in step_groups.items():
             if len(results_list) > 1:
                 # Extract p-values (filter out NaN)
-                p_values = [r['p_value'] for r in results_list if not np.isnan(r['p_value'])]
-                valid_indices = [i for i, r in enumerate(results_list) if not np.isnan(r['p_value'])]
+                p_values = [r['p_value'] for r in results_list if _valid_p(r['p_value'])]
+                valid_indices = [i for i, r in enumerate(results_list) if _valid_p(r['p_value'])]
                 
                 if len(p_values) > 1:
                     try:
@@ -1595,11 +1675,14 @@ class FrequencyAnalyzerDependent:
     def _apply_fdr_to_results(self, results: List[Dict]) -> List[Dict]:
         """Apply FDR correction separately for each effect type."""
         
+        def _valid_p(val: float) -> bool:
+            return val is not None and np.isfinite(val)
+        
         effect_types = ['between_p', 'within_p', 'interaction_p']
         
         for effect_type in effect_types:
-            p_values = [r[effect_type] for r in results if not np.isnan(r[effect_type])]
-            valid_indices = [i for i, r in enumerate(results) if not np.isnan(r[effect_type])]
+            p_values = [r[effect_type] for r in results if _valid_p(r.get(effect_type))]
+            valid_indices = [i for i, r in enumerate(results) if _valid_p(r.get(effect_type))]
             
             if len(p_values) > 1:
                 try:
@@ -1642,7 +1725,7 @@ class FrequencyAnalyzerDependent:
                 row = {
                     'Step_Value': step_value,
                     'Step_Label': f"{x_name}={step_value}",
-                    'Test_Type': 'Mixed ANOVA'
+                    'Test_Type': result.get('Test', 'Mixed ANOVA')
                 }
                 
                 # Add effect p-values
@@ -1672,7 +1755,7 @@ class FrequencyAnalyzerDependent:
             
             # Reorder columns to ensure correct order (matching Stats_parameters structure)
             # Order: Step_Value -> Group stats -> ANOVA effects
-            base_cols = ['Step_Value']
+            base_cols = ['Step_Value', 'Test_Type']
             
             # Extract group names and sort them, then add mean, SEM, n for each group in that order
             group_names_set = set()
@@ -1728,7 +1811,7 @@ class FrequencyAnalyzerDependent:
             base_cols = [step_key, 'Test_Type', 'Comparison']
             group_cols = ['Group1', 'Group1_mean', 'Group1_stderr', 'Group1_n',
                          'Group2', 'Group2_mean', 'Group2_stderr', 'Group2_n']
-            stat_cols = ['t_statistic', 'p_value']
+            stat_cols = ['p_value']
             if 'corrected_p' in df.columns:
                 stat_cols.append('corrected_p')
             

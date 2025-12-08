@@ -4,7 +4,7 @@ Statistical analysis for AP attenuation (AP number vs peak).
 
 import pandas as pd
 import numpy as np
-from scipy.stats import ttest_ind, t
+from scipy.stats import ttest_ind, t, kruskal
 import os
 import logging
 import math
@@ -12,8 +12,11 @@ from typing import List, Dict, Tuple, Optional
 
 import statsmodels.stats.multitest as multi
 from statsmodels.formula.api import mixedlm
+from statsmodels.stats.oneway import anova_oneway
+import scikit_posthocs as sp
 
 from ...shared.data_models import ExperimentalDesign, StatisticalResult, DesignType
+from ...shared.utils import should_use_parametric
 from .posthoc_utils import (
     should_run_posthocs,
     get_simple_effect_comparisons,
@@ -173,7 +176,7 @@ class AttenuationAnalyzer:
                 if len(ap_data) > 0:
                     mean_val = ap_data.mean()
                     means.append(mean_val)
-                    sems.append(ap_data.std() / np.sqrt(len(ap_data)))
+                    sems.append(ap_data.std(ddof=1) / np.sqrt(len(ap_data)))
                     if i < 3:  # Log first 3 APs
                         logger.info(f"DEBUG: AP {i}: {len(ap_data)} cells, mean={mean_val:.2f}, values={list(ap_data[:3])}")
                 else:
@@ -229,7 +232,7 @@ class AttenuationAnalyzer:
                         group_ap_values[group_name] = ap_data
                         group_stats[group_name] = {
                             'mean': ap_data.mean(),
-                            'stderr': ap_data.std() / np.sqrt(len(ap_data)),
+                            'stderr': ap_data.std(ddof=1) / np.sqrt(len(ap_data)),
                             'n': len(ap_data)
                         }
                     else:
@@ -245,6 +248,9 @@ class AttenuationAnalyzer:
                 continue
             
             group_data_lists = [group_ap_values[name] for name in group_names]
+            
+            # Decide parametric vs nonparametric using skewness/kurtosis
+            use_parametric = should_use_parametric(group_data_lists)
             
             # Run ANOVA (one-way or two-way depending on design)
             try:
@@ -327,15 +333,28 @@ class AttenuationAnalyzer:
                     all_results.append(result)
                     
                 else:
-                    # Standard one-way ANOVA
-                    f_stat, anova_p = f_oneway(*group_data_lists)
+                    # Standard one-way: choose Welch ANOVA or Kruskal-Wallis based on use_parametric
+                    if use_parametric:
+                        try:
+                            welch_res = anova_oneway(group_data_lists, use_var="unequal", welch_correction=True)
+                            anova_p = welch_res.pvalue
+                            test_type = 'Welch_ANOVA'
+                            f_stat = np.nan
+                        except Exception as e:
+                            logger.warning(f"Welch ANOVA failed at AP {ap_pos}: {e}")
+                            anova_p = np.nan
+                            test_type = 'Welch_ANOVA'
+                            f_stat = np.nan
+                    else:
+                        h_stat, anova_p = kruskal(*group_data_lists)
+                        test_type = 'Kruskal_Wallis'
+                        f_stat = h_stat
                     
                     # Create ANOVA result
                     anova_result = {
                         'AP_Number': ap_pos,
-                        'Test_Type': 'ANOVA',
+                        'Test_Type': test_type,
                         'Comparison': f"Overall ({' vs '.join(group_names)})",
-                        'F_statistic': f_stat,
                         'p_value': anova_p,
                         'measurement_type': 'attenuation'
                     }
@@ -353,11 +372,11 @@ class AttenuationAnalyzer:
                     
                     if len(group_names) <= 2:
                         if anova_p < 0.05:
-                            logger.info(f"AP {ap_pos} ANOVA significant (p={anova_p:.4f}) - no post-hoc needed (only 2 groups)")
+                            logger.info(f"AP {ap_pos} {test_type} significant (p={anova_p:.4f}) - no post-hoc needed (only 2 groups)")
                         else:
-                            logger.info(f"AP {ap_pos} ANOVA not significant (p={anova_p:.4f})")
+                            logger.info(f"AP {ap_pos} {test_type} not significant (p={anova_p:.4f})")
                     else:
-                        logger.info(f"AP {ap_pos} ANOVA (p={anova_p:.4f}) - will check corrected p-value for post-hoc")
+                        logger.info(f"AP {ap_pos} {test_type} (p={anova_p:.4f}) - will check corrected p-value for post-hoc")
                     
             except Exception as e:
                 logger.warning(f"Error running ANOVA for AP {ap_pos}: {e}")
@@ -412,7 +431,7 @@ class AttenuationAnalyzer:
                                     ap_group_data[group_name] = ap_values
                                     ap_group_stats[group_name] = {
                                         'mean': ap_values.mean(),
-                                        'stderr': ap_values.std() / np.sqrt(len(ap_values)),
+                                        'stderr': ap_values.std(ddof=1) / np.sqrt(len(ap_values)),
                                         'n': len(ap_values)
                                     }
                                 else:
@@ -452,7 +471,6 @@ class AttenuationAnalyzer:
                                             'Group2_mean': ap_group_stats[group2_name]['mean'],
                                             'Group2_stderr': ap_group_stats[group2_name]['stderr'],
                                             'Group2_n': ap_group_stats[group2_name]['n'],
-                                            't_statistic': t_stat,
                                             'p_value': pairwise_p,
                                             'measurement_type': 'attenuation'
                                         }
@@ -479,16 +497,22 @@ class AttenuationAnalyzer:
                             from itertools import combinations
                             comparisons_to_run = list(combinations(ap_group_data.keys(), 2))
                             
-                            for group1_name, group2_name in comparisons_to_run:
-                                if group1_name in ap_group_data and group2_name in ap_group_data:
-                                    t_stat, pairwise_p = ttest_ind(
-                                        ap_group_data[group1_name], ap_group_data[group2_name],
-                                        nan_policy="omit", equal_var=False
-                                    )
-                                    
+                            if result.get('Test_Type') == 'Kruskal_Wallis':
+                                # Dunn posthocs for KW
+                                values = []
+                                labels = []
+                                for gname, data in ap_group_data.items():
+                                    values.extend(list(data.values))
+                                    labels.extend([gname] * len(data))
+                                dunn_input = pd.DataFrame({'val': values, 'grp': labels})
+                                dunn_df = sp.posthoc_dunn(dunn_input, val_col='val', group_col='grp')
+                                dunn_df = dunn_df.reindex(index=ap_group_data.keys(), columns=ap_group_data.keys())
+                                
+                                for group1_name, group2_name in comparisons_to_run:
+                                    p_val = dunn_df.loc[group1_name, group2_name]
                                     pairwise_result = {
                                         'AP_Number': ap_pos, 
-                                        'Test_Type': 'Post-hoc t-test',
+                                        'Test_Type': 'Post-hoc Dunn',
                                         'Comparison': f"{group1_name} vs {group2_name}",
                                         'Group1': group1_name,
                                         'Group1_mean': ap_group_stats[group1_name]['mean'],
@@ -498,11 +522,34 @@ class AttenuationAnalyzer:
                                         'Group2_mean': ap_group_stats[group2_name]['mean'],
                                         'Group2_stderr': ap_group_stats[group2_name]['stderr'],
                                         'Group2_n': ap_group_stats[group2_name]['n'],
-                                        't_statistic': t_stat,
-                                        'p_value': pairwise_p,
+                                        'p_value': p_val,
                                         'measurement_type': 'attenuation'
                                     }
                                     posthoc_results.append(pairwise_result)
+                            else:
+                                for group1_name, group2_name in comparisons_to_run:
+                                    if group1_name in ap_group_data and group2_name in ap_group_data:
+                                        t_stat, pairwise_p = ttest_ind(
+                                            ap_group_data[group1_name], ap_group_data[group2_name],
+                                            nan_policy="omit", equal_var=False
+                                        )
+                                        
+                                        pairwise_result = {
+                                            'AP_Number': ap_pos, 
+                                            'Test_Type': 'Post-hoc t-test',
+                                            'Comparison': f"{group1_name} vs {group2_name}",
+                                            'Group1': group1_name,
+                                            'Group1_mean': ap_group_stats[group1_name]['mean'],
+                                            'Group1_stderr': ap_group_stats[group1_name]['stderr'],
+                                            'Group1_n': ap_group_stats[group1_name]['n'],
+                                            'Group2': group2_name,
+                                            'Group2_mean': ap_group_stats[group2_name]['mean'],
+                                            'Group2_stderr': ap_group_stats[group2_name]['stderr'],
+                                            'Group2_n': ap_group_stats[group2_name]['n'],
+                                            'p_value': pairwise_p,
+                                            'measurement_type': 'attenuation'
+                                        }
+                                        posthoc_results.append(pairwise_result)
             
             # Add post-hoc results to all results and apply FDR correction to them
             all_results.extend(posthoc_results)
@@ -570,7 +617,6 @@ class AttenuationAnalyzer:
                 'Group2_mean': stats2['mean'],
                 'Group2_stderr': math.sqrt(stats2['variance']),
                 'Group2_n': stats2['count'],
-                't_statistic': t_statistic,
                 'p_value': p_value,
                 'measurement_type': 'attenuation'
             }
@@ -582,6 +628,9 @@ class AttenuationAnalyzer:
         """Apply FDR correction to attenuation results.
         Handles both regular one-way ANOVA and factorial two-way ANOVA."""
         import statsmodels.stats.multitest as multi
+        
+        def _valid_p(val: float) -> bool:
+            return val is not None and np.isfinite(val)
         
         # Check if we have factorial results
         has_factorial = any('Two-Way ANOVA' in r.get('Test_Type', '') for r in results)
@@ -597,8 +646,8 @@ class AttenuationAnalyzer:
                 
                 # Correct each effect type separately
                 for effect_col in effect_cols:
-                    pvals = [r[effect_col] for r in anova_results if not np.isnan(r.get(effect_col, np.nan))]
-                    valid_indices = [i for i, r in enumerate(anova_results) if not np.isnan(r.get(effect_col, np.nan))]
+                    pvals = [r.get(effect_col) for r in anova_results if _valid_p(r.get(effect_col, np.nan))]
+                    valid_indices = [i for i, r in enumerate(anova_results) if _valid_p(r.get(effect_col, np.nan))]
                     
                     if len(pvals) > 1:
                         _, corrected_p, _, _ = multi.multipletests(pvals, method="fdr_bh")
@@ -620,12 +669,12 @@ class AttenuationAnalyzer:
                             raw_p = result.get(effect_col, np.nan)
                             result[corrected_col] = raw_p if not np.isnan(raw_p) else np.nan
         else:
-            # Regular one-way ANOVA (handling NaN p-values)
-            anova_results = [r for r in results if r['Test_Type'] == 'ANOVA']
+            # Regular one-way tests (ANOVA/Welch/KW)
+            anova_results = [r for r in results if r.get('Test_Type') in ['ANOVA', 'Welch_ANOVA', 'Kruskal_Wallis']]
             
             if len(anova_results) > 1:
                 # Extract p-values and track valid indices
-                valid_indices = [i for i, r in enumerate(anova_results) if not np.isnan(r['p_value'])]
+                valid_indices = [i for i, r in enumerate(anova_results) if _valid_p(r.get('p_value'))]
                 valid_p_values = [anova_results[i]['p_value'] for i in valid_indices]
                 
                 if len(valid_p_values) > 1:
@@ -645,10 +694,10 @@ class AttenuationAnalyzer:
                         if i not in valid_indices:
                             anova_results[i]['corrected_p'] = np.nan
             
-            logger.info(f"Applied FDR correction: {len(anova_results)} ANOVA tests")
+            logger.info(f"Applied FDR correction: {len(anova_results)} one-way tests")
         
         # Apply FDR to post-hoc p-values within each AP number's family (same for both designs)
-        posthoc_results = [r for r in results if r.get('Test_Type') == 'Post-hoc t-test']
+        posthoc_results = [r for r in results if r.get('Test_Type') in ['Post-hoc t-test', 'Post-hoc Dunn']]
         
         # Group post-hoc results by AP number (each ANOVA family)
         ap_groups = {}
@@ -662,8 +711,8 @@ class AttenuationAnalyzer:
         for ap_num, results_list in ap_groups.items():
             if len(results_list) > 1:
                 # Extract p-values (filter out NaN)
-                pvals = [r['p_value'] for r in results_list if not np.isnan(r['p_value'])]
-                valid_indices = [i for i, r in enumerate(results_list) if not np.isnan(r['p_value'])]
+                pvals = [r['p_value'] for r in results_list if _valid_p(r['p_value'])]
+                valid_indices = [i for i, r in enumerate(results_list) if _valid_p(r['p_value'])]
                 
                 if len(pvals) > 1:
                     _, corrected_p, _, _ = multi.multipletests(pvals, method="fdr_bh")
@@ -1039,8 +1088,8 @@ class AttenuationAnalyzer:
         if is_factorial:
             anova_results = [r for r in stat_data if r.get('Test_Type') == 'Two-Way ANOVA']
         else:
-            anova_results = [r for r in stat_data if r.get('Test_Type') == 'ANOVA']
-        posthoc_results = [r for r in stat_data if r.get('Test_Type') == 'Post-hoc t-test']
+            anova_results = [r for r in stat_data if r.get('Test_Type') in ['ANOVA', 'Welch_ANOVA', 'Kruskal_Wallis']]
+        posthoc_results = [r for r in stat_data if r.get('Test_Type') in ['Post-hoc t-test', 'Post-hoc Dunn']]
         
         # Save ANOVA results
         if anova_results:
@@ -1048,7 +1097,7 @@ class AttenuationAnalyzer:
             
             if is_factorial:
                 # For factorial: one row per AP with all effects as columns (matching Stats_parameters structure)
-                base_cols = ['AP_Number']
+                base_cols = ['AP_Number', 'Test_Type']
                 
                 # Add group statistics columns (mean, SEM, n for each group) - FIRST after AP_Number
                 # Extract group names and sort them, then add mean, SEM, n for each group in that order
@@ -1087,7 +1136,7 @@ class AttenuationAnalyzer:
                 available_cols = base_cols + group_stat_cols + effect_cols
             else:
                 # For one-way ANOVA: simpler format (matching Stats_parameters structure)
-                base_cols = ['AP_Number']
+                base_cols = ['AP_Number', 'Test_Type']
                 
                 # Add group statistics columns (mean, SEM, n for each group) - FIRST after AP_Number
                 # Extract group names and sort them, then add mean, SEM, n for each group in that order
@@ -1105,8 +1154,8 @@ class AttenuationAnalyzer:
                     if f'{group_name}_n' in df_anova.columns:
                         group_stat_cols.append(f'{group_name}_n')
                 
-                # ANOVA statistics last
-                stat_cols = ['F_statistic', 'p_value']
+                # ANOVA statistics last (drop F-stat to avoid NaNs for Welch/KW)
+                stat_cols = ['p_value']
                 if 'corrected_p' in df_anova.columns:
                     stat_cols.append('corrected_p')
                 
@@ -1125,7 +1174,7 @@ class AttenuationAnalyzer:
             # Organize columns: AP info, comparison, group stats, then p-values
             base_cols = ['AP_Number', 'Test_Type', 'Comparison']
             group_cols = []
-            stat_cols = ['t_statistic', 'p_value']
+            stat_cols = ['p_value']
             if 'corrected_p' in df_posthoc.columns:
                 stat_cols.append('corrected_p')
             

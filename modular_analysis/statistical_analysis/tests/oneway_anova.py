@@ -4,7 +4,7 @@ One-way ANOVA implementation for multiple independent groups.
 
 import pandas as pd
 import numpy as np
-from scipy.stats import f_oneway
+from scipy.stats import kruskal, mannwhitneyu
 from scipy import stats
 import math
 import logging
@@ -15,9 +15,11 @@ from itertools import combinations
 import statsmodels.stats.multitest as multi
 from statsmodels.stats.anova import anova_lm
 from statsmodels.formula.api import ols
+from statsmodels.stats.oneway import anova_oneway
+import scikit_posthocs as sp
 
 from ...shared.data_models import ExperimentalDesign, StatisticalResult, DataContainer
-from ...shared.utils import clean_dataframe, categorize_measurement, get_measurement_categories
+from ...shared.utils import clean_dataframe, categorize_measurement, get_measurement_categories, should_use_parametric
 
 logger = logging.getLogger(__name__)
 
@@ -131,7 +133,7 @@ class OneWayANOVA:
                     group_arrays.append(data)
                     group_stats[group.name] = {
                         'mean': data.mean(),
-                        'stderr': data.std() / math.sqrt(len(data)),
+                        'stderr': data.std(ddof=1) / math.sqrt(len(data)),
                         'n': len(data)
                     }
         
@@ -139,17 +141,27 @@ class OneWayANOVA:
         if len(group_arrays) < 3:
             logger.warning(f"Insufficient groups with data for {column}: {len(group_arrays)}")
             return None
+        
+        # Decide parametric vs nonparametric using skewness/kurtosis
+        use_parametric = should_use_parametric(group_arrays)
             
-        # Run ANOVA
+        # Run test
         try:
-            f_stat, p_value = f_oneway(*group_arrays)
+            if use_parametric:
+                # Welch one-way ANOVA (unequal variances)
+                res = anova_oneway(group_arrays, use_var="unequal", welch_correction=True)
+                p_value = res.pvalue
+                test_label = self.name + " (Welch)"
+            else:
+                h_stat, p_value = kruskal(*group_arrays)
+                test_label = "Kruskal-Wallis"
             
             # Create result (using first two groups for compatibility, but includes ANOVA p-value)
             first_group = groups[0].name
             second_group = groups[1].name
             
             return StatisticalResult(
-                test_name=self.name,
+                test_name=test_label,
                 measurement=column,
                 group1_name=first_group,
                 group1_mean=group_stats[first_group]['mean'] if first_group in group_stats else 0,
@@ -190,23 +202,73 @@ class OneWayANOVA:
         
         logger.info(f"Running post-hoc pairwise comparisons for {len(significant_measurements)} significant measurements")
         
-        # Run pairwise comparisons only for significant measurements
         pairwise_results = []
         group_names = [g.name for g in groups if g.name in group_data]
         
-        # Generate all pairwise combinations
-        for group1_name, group2_name in combinations(group_names, 2):
-            for measurement in significant_measurements:
-                result = self._run_pairwise_test(measurement, group_data[group1_name], 
-                                               group_data[group2_name], group1_name, group2_name)
-                if result:
-                    pairwise_results.append(result)
+        for measurement in significant_measurements:
+            # Look up which omnibus test was used for this measurement
+            anova_result = next((r for r in anova_results if r.measurement == measurement), None)
+            is_nonparametric = anova_result and "Kruskal-Wallis" in anova_result.test_name
+            
+            if is_nonparametric and sp is not None:
+                # Use Dunn for all pairwise comparisons, then FDR later
+                values = []
+                labels = []
+                group_stats = {}
+                for gname in group_names:
+                    if measurement in group_data[gname].columns:
+                        data = group_data[gname][measurement].dropna()
+                        if len(data) > 0:
+                            values.extend(list(data.values))
+                            labels.extend([gname] * len(data))
+                            group_stats[gname] = {
+                                'mean': data.mean(),
+                                'stderr': data.std(ddof=1) / math.sqrt(len(data)) if len(data) > 1 else 0.0,
+                                'n': len(data)
+                            }
+                if len(set(labels)) >= 2 and len(values) > 0:
+                    dunn_input = pd.DataFrame({'val': values, 'grp': labels})
+                    dunn_df = sp.posthoc_dunn(dunn_input, val_col='val', group_col='grp')
+                    # Ensure ordering matches group_names
+                    dunn_df = dunn_df.reindex(index=group_names, columns=group_names)
+                    for g1, g2 in combinations(group_names, 2):
+                        p_val = dunn_df.loc[g1, g2]
+                        pairwise_results.append(
+                            StatisticalResult(
+                                test_name=f"Pairwise Dunn ({g1} vs {g2})",
+                                measurement=measurement,
+                                group1_name=g1,
+                                group1_mean=group_stats.get(g1, {}).get('mean', 0),
+                                group1_stderr=group_stats.get(g1, {}).get('stderr', 0),
+                                group1_n=group_stats.get(g1, {}).get('n', 0),
+                                group2_name=g2,
+                                group2_mean=group_stats.get(g2, {}).get('mean', 0),
+                                group2_stderr=group_stats.get(g2, {}).get('stderr', 0),
+                                group2_n=group_stats.get(g2, {}).get('n', 0),
+                                p_value=p_val,
+                                measurement_type=anova_result.measurement_type if anova_result else ""
+                            )
+                        )
+            else:
+                # Parametric or fallback: run pairwise tests as before
+                for group1_name, group2_name in combinations(group_names, 2):
+                    result = self._run_pairwise_test(
+                        measurement,
+                        group_data[group1_name],
+                        group_data[group2_name],
+                        group1_name,
+                        group2_name,
+                        force_parametric=not is_nonparametric if anova_result else None
+                    )
+                    if result:
+                        pairwise_results.append(result)
         
         return pairwise_results
     
     def _run_pairwise_test(self, column: str, df1: pd.DataFrame, df2: pd.DataFrame,
-                          group1_name: str, group2_name: str) -> Optional[StatisticalResult]:
-        """Run a single pairwise t-test."""
+                          group1_name: str, group2_name: str,
+                          force_parametric: Optional[bool] = None) -> Optional[StatisticalResult]:
+        """Run a single pairwise test with parametric/nonparametric decision."""
         
         # Extract data, dropping NaN values
         data1 = df1[column].dropna()
@@ -219,16 +281,29 @@ class OneWayANOVA:
         # Calculate descriptive statistics
         mean1 = data1.mean()
         mean2 = data2.mean()
-        se1 = data1.std() / math.sqrt(len(data1))
-        se2 = data2.std() / math.sqrt(len(data2))
+        se1 = data1.std(ddof=1) / math.sqrt(len(data1))
+        se2 = data2.std(ddof=1) / math.sqrt(len(data2))
         
-        # Run t-test
+        # Decide parametric vs nonparametric
+        # Follow the omnibus choice: if Kruskal-Wallis was used, force nonparametric;
+        # otherwise use parametric. No per-pair Shapiro needed.
+        if force_parametric is not None:
+            use_parametric = force_parametric
+        else:
+            use_parametric = True
+        
         try:
-            from scipy.stats import ttest_ind
-            t_stat, p_value = ttest_ind(data1, data2, nan_policy="omit", equal_var=False)
+            if use_parametric:
+                from scipy.stats import ttest_ind
+                t_stat, p_value = ttest_ind(data1, data2, nan_policy="omit", equal_var=False)
+                test_label = f"Pairwise t-test ({group1_name} vs {group2_name})"
+            else:
+                mw = mannwhitneyu(data1, data2, alternative="two-sided")
+                p_value = mw.pvalue
+                test_label = f"Pairwise Mann-Whitney ({group1_name} vs {group2_name})"
             
             return StatisticalResult(
-                test_name=f"Pairwise t-test ({group1_name} vs {group2_name})",
+                test_name=test_label,
                 measurement=column,
                 group1_name=group1_name,
                 group1_mean=mean1,
@@ -254,7 +329,11 @@ class OneWayANOVA:
         
         for category_name in categories.keys():
             # Get ANOVA results for this category
-            category_results = [r for r in results if r.measurement_type == category_name and r.test_name == self.name]
+            category_results = [
+                r for r in results
+                if r.measurement_type == category_name
+                and (r.test_name.startswith(self.name) or "Kruskal-Wallis" in r.test_name)
+            ]
             
             if len(category_results) > 1:
                 # Extract p-values and track valid indices (handling NaN)
@@ -329,7 +408,7 @@ class OneWayANOVA:
                         for i, result in enumerate(results_list):
                             if np.isnan(result.p_value) and not hasattr(result, 'corrected_p'):
                                 result.corrected_p = np.nan
-                            
+                        
                         logger.info(f"Applied FDR correction to {len(p_values)} pairwise tests for {measurement}")
                         
                     except Exception as e:
@@ -359,7 +438,10 @@ class OneWayANOVA:
             return
             
         # Separate ANOVA and pairwise results
-        anova_results = [r for r in results if r.test_name == self.name]
+        anova_results = [
+            r for r in results
+            if r.test_name.startswith(self.name) or "Kruskal-Wallis" in r.test_name
+        ]
         pairwise_results = [r for r in results if "Pairwise" in r.test_name]
         
         # Get all unique groups - prefer from design if available, otherwise from results
@@ -402,13 +484,19 @@ class OneWayANOVA:
             # Start row with measurement info
             row = {
                 "Measurement": measurement,
-                "MeasurementType": None
+                "MeasurementType": None,
+                "Test_Type": None,
+                "Omnibus_p-value": np.nan,
+                "Omnibus_corrected_p": np.nan
             }
             
-            # Get ANOVA result for this measurement
+            # Get ANOVA/Welch/KW result for this measurement
             anova_result = next((r for r in anova_results if r.measurement == measurement), None)
             if anova_result:
                 row["MeasurementType"] = anova_result.measurement_type
+                row["Test_Type"] = anova_result.test_name
+                row["Omnibus_p-value"] = anova_result.p_value
+                row["Omnibus_corrected_p"] = anova_result.corrected_p
             
             # Add group statistics (mean, stderr, n) for each group
             # Priority: pairwise results > raw data calculation > ANOVA result (fallback)
@@ -440,7 +528,7 @@ class OneWayANOVA:
                             if len(data) > 0:
                                 group_stats[group_name] = {
                                     'mean': data.mean(),
-                                    'stderr': data.std() / math.sqrt(len(data)) if len(data) > 1 else 0,
+                                    'stderr': data.std(ddof=1) / math.sqrt(len(data)) if len(data) > 1 else 0,
                                     'n': len(data)
                                 }
             
@@ -493,15 +581,15 @@ class OneWayANOVA:
         # Create DataFrame and organize columns
         combined_df = pd.DataFrame(combined_data)
         
-        # Order columns: Measurement, MeasurementType, then groups (mean, stderr, n), then ANOVA, then pairwise
-        ordered_columns = ["Measurement", "MeasurementType"]
+        # Order columns: Measurement, MeasurementType, Test_Type, then groups (mean, stderr, n), then p-values, then pairwise
+        ordered_columns = ["Measurement", "MeasurementType", "Test_Type"]
         
         # Add group columns in order
         for group in all_groups:
             ordered_columns.extend([f"{group}_mean", f"{group}_stderr", f"{group}_n"])
         
-        # Add ANOVA columns (p-value first, then corrected_p)
-        ordered_columns.extend(["ANOVA_p-value", "ANOVA_corrected_p"])
+        # Add omnibus columns (p-value first, then corrected_p)
+        ordered_columns.extend(["Omnibus_p-value", "Omnibus_corrected_p"])
         
         # Add pairwise columns in correct order (p-value before corrected_p for each comparison)
         for comparison in all_comparisons:

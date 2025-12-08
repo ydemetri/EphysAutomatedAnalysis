@@ -5,6 +5,7 @@ Repeated measures ANOVA implementation for 3+ dependent groups (within-subjects 
 import pandas as pd
 import numpy as np
 import pingouin as pg
+from scipy.stats import friedmanchisquare, wilcoxon
 import math
 import logging
 import os
@@ -14,7 +15,7 @@ from itertools import combinations
 import statsmodels.stats.multitest as multi
 
 from ...shared.data_models import ExperimentalDesign, StatisticalResult, DataContainer
-from ...shared.utils import clean_dataframe, categorize_measurement, get_measurement_categories
+from ...shared.utils import clean_dataframe, categorize_measurement, get_measurement_categories, should_use_parametric
 
 logger = logging.getLogger(__name__)
 
@@ -178,16 +179,49 @@ class RepeatedMeasuresANOVA:
             logger.warning(f"Insufficient subjects per condition for {column}")
             return None
         
-        # Run repeated measures ANOVA using pingouin
+        # Decide parametric vs nonparametric using skewness/kurtosis
+        condition_arrays = []
+        for condition in conditions:
+            cond_vals = df_long[df_long['Condition'] == condition]['Value'].values
+            condition_arrays.append(cond_vals)
+        use_parametric = should_use_parametric(condition_arrays)
+        
+        # Run repeated measures test
         try:
-            aov = pg.rm_anova(
-                dv='Value',
-                within='Condition',
-                subject='Subject_ID',
-                data=df_long
-            )
-            
-            p_value = aov['p-unc'].values[0]
+            if use_parametric:
+                aov = pg.rm_anova(
+                    dv='Value',
+                    within='Condition',
+                    subject='Subject_ID',
+                    data=df_long
+                )
+                p_unc = aov['p-unc'].values[0]
+                p_gg = aov['p-GG-corr'].values[0] if 'p-GG-corr' in aov.columns else np.nan
+                p_hf = aov['p-HF-corr'].values[0] if 'p-HF-corr' in aov.columns else np.nan
+                eps_gg = aov['eps GG'].values[0] if 'eps GG' in aov.columns else np.nan
+                mauchly_p = aov['p-spher'].values[0] if 'p-spher' in aov.columns else np.nan
+                
+                # Choose correction when sphericity is violated; otherwise use uncorrected
+                if not np.isnan(mauchly_p) and mauchly_p <= 0.05:
+                    if not np.isnan(eps_gg) and eps_gg < 0.75:
+                        p_value = p_gg
+                        correction_used = "Greenhouse-Geisser"
+                    else:
+                        p_value = p_hf if not np.isnan(p_hf) else p_gg
+                        correction_used = "Huynh-Feldt" if not np.isnan(p_hf) else "Greenhouse-Geisser"
+                else:
+                    p_value = p_unc
+                    correction_used = "uncorrected"
+                
+                test_label = f"{self.name} ({correction_used})"
+            else:
+                # Require balanced data for Friedman
+                pivot = df_long.pivot(index='Subject_ID', columns='Condition', values='Value').dropna()
+                if pivot.shape[0] < 2:
+                    logger.warning(f"Insufficient complete cases for Friedman on {column}")
+                    return None
+                stat, p_value = friedmanchisquare(*[pivot[c].values for c in pivot.columns])
+                test_label = "Friedman"
             
             # Calculate group statistics for first two conditions (for StatisticalResult compatibility)
             cond1, cond2 = conditions[0], conditions[1]
@@ -195,17 +229,18 @@ class RepeatedMeasuresANOVA:
             cond2_data = df_long[df_long['Condition'] == cond2]['Value']
             
             return StatisticalResult(
-                test_name=self.name,
+                test_name=test_label,
                 measurement=column,
                 group1_name=cond1,
                 group1_mean=cond1_data.mean(),
-                group1_stderr=cond1_data.std() / math.sqrt(len(cond1_data)),
+                group1_stderr=cond1_data.std(ddof=1) / math.sqrt(len(cond1_data)),
                 group1_n=len(cond1_data),
                 group2_name=cond2,
                 group2_mean=cond2_data.mean(),
-                group2_stderr=cond2_data.std() / math.sqrt(len(cond2_data)),
+                group2_stderr=cond2_data.std(ddof=1) / math.sqrt(len(cond2_data)),
                 group2_n=len(cond2_data),
                 p_value=p_value,
+                corrected_p=p_value if use_parametric else None,
                 measurement_type=categorize_measurement(column)
             )
             
@@ -244,8 +279,16 @@ class RepeatedMeasuresANOVA:
         # Generate all pairwise combinations of conditions
         for cond1, cond2 in combinations(conditions, 2):
             for measurement in significant_measurements:
+                # Look up which omnibus test was used for this measurement
+                anova_result = next((r for r in anova_results if r.measurement == measurement), None)
+                force_parametric = None
+                if anova_result:
+                    if "Friedman" in anova_result.test_name:
+                        force_parametric = False
+                    else:
+                        force_parametric = True
                 result = self._run_pairwise_paired_test(
-                    measurement, all_group_data, cond1, cond2, manifest
+                    measurement, all_group_data, cond1, cond2, manifest, force_parametric=force_parametric
                 )
                 if result:
                     pairwise_results.append(result)
@@ -253,7 +296,8 @@ class RepeatedMeasuresANOVA:
         return pairwise_results
     
     def _run_pairwise_paired_test(self, column: str, all_group_data: Dict[str, pd.DataFrame],
-                                  cond1: str, cond2: str, manifest: pd.DataFrame) -> Optional[StatisticalResult]:
+                                  cond1: str, cond2: str, manifest: pd.DataFrame,
+                                  force_parametric: Optional[bool] = None) -> Optional[StatisticalResult]:
         """Run a single pairwise paired t-test between two conditions."""
         
         # Map condition names to group folder names - require exact match
@@ -305,24 +349,36 @@ class RepeatedMeasuresANOVA:
         if len(data1_list) < 3:
             return None
         
-        # Run paired t-test using pingouin
+        # Follow the omnibus choice: if Friedman was used, force nonparametric;
+        # otherwise use parametric. No per-pair Shapiro needed.
+        if force_parametric is not None:
+            use_parametric = force_parametric
+        else:
+            use_parametric = True
+        
+        # Run paired test
         try:
             data1_arr = np.array(data1_list)
             data2_arr = np.array(data2_list)
             
-            t_result = pg.ttest(data1_arr, data2_arr, paired=True)
-            p_value = t_result['p-val'].values[0]
+            if use_parametric:
+                t_result = pg.ttest(data1_arr, data2_arr, paired=True)
+                p_value = t_result['p-val'].values[0]
+                test_label = f"Pairwise paired t-test ({cond1} vs {cond2})"
+            else:
+                w_stat, p_value = wilcoxon(data1_arr, data2_arr, zero_method="wilcox", alternative="two-sided")
+                test_label = f"Pairwise Wilcoxon ({cond1} vs {cond2})"
             
             return StatisticalResult(
-                test_name=f"Pairwise paired t-test ({cond1} vs {cond2})",
+                test_name=test_label,
                 measurement=column,
                 group1_name=cond1,
                 group1_mean=data1_arr.mean(),
-                group1_stderr=data1_arr.std() / math.sqrt(len(data1_arr)),
+                group1_stderr=data1_arr.std(ddof=1) / math.sqrt(len(data1_arr)),
                 group1_n=len(data1_arr),
                 group2_name=cond2,
                 group2_mean=data2_arr.mean(),
-                group2_stderr=data2_arr.std() / math.sqrt(len(data2_arr)),
+                group2_stderr=data2_arr.std(ddof=1) / math.sqrt(len(data2_arr)),
                 group2_n=len(data2_arr),
                 p_value=p_value,
                 measurement_type=categorize_measurement(column)
@@ -340,8 +396,11 @@ class RepeatedMeasuresANOVA:
         
         for category_name in categories.keys():
             # Get RM-ANOVA results for this category
-            category_results = [r for r in results 
-                              if r.measurement_type == category_name and r.test_name == self.name]
+            category_results = [
+                r for r in results
+                if r.measurement_type == category_name
+                and (r.test_name == self.name or "Friedman" in r.test_name)
+            ]
             
             if len(category_results) > 1:
                 # Extract p-values and track valid indices (handling NaN)
@@ -445,8 +504,11 @@ class RepeatedMeasuresANOVA:
             logger.warning("No results to save")
             return
             
-        # Separate RM-ANOVA and pairwise results
-        anova_results = [r for r in results if r.test_name == self.name]
+        # Separate RM-ANOVA/Friedman and pairwise results
+        anova_results = [
+            r for r in results
+            if r.test_name == self.name or "Friedman" in r.test_name
+        ]
         pairwise_results = [r for r in results if "Pairwise" in r.test_name]
         
         # Get all unique conditions from design
@@ -485,13 +547,19 @@ class RepeatedMeasuresANOVA:
             # Start row with measurement info
             row = {
                 "Measurement": measurement,
-                "MeasurementType": None
+                "MeasurementType": None,
+                "Test_Type": None,
+                "Omnibus_p-value": np.nan,
+                "Omnibus_corrected_p": np.nan
             }
             
             # Get RM-ANOVA result for this measurement
             anova_result = next((r for r in anova_results if r.measurement == measurement), None)
             if anova_result:
                 row["MeasurementType"] = anova_result.measurement_type
+                row["Test_Type"] = anova_result.test_name
+                row["Omnibus_p-value"] = anova_result.p_value
+                row["Omnibus_corrected_p"] = anova_result.corrected_p
             
             # Add group statistics (mean, stderr, n) for each condition
             condition_stats = {}
@@ -537,7 +605,7 @@ class RepeatedMeasuresANOVA:
                             if len(data) > 0:
                                 condition_stats[cond_name] = {
                                     'mean': data.mean(),
-                                    'stderr': data.std() / math.sqrt(len(data)) if len(data) > 1 else 0,
+                                    'stderr': data.std(ddof=1) / math.sqrt(len(data)) if len(data) > 1 else 0,
                                     'n': len(data)
                                 }
             
@@ -552,13 +620,13 @@ class RepeatedMeasuresANOVA:
                     row[f"{cond}_stderr"] = np.nan
                     row[f"{cond}_n"] = 0
             
-            # Add RM-ANOVA p-values
+            # Add omnibus p-values
             if anova_result:
-                row["RM_ANOVA_p-value"] = anova_result.p_value
-                row["RM_ANOVA_corrected_p"] = anova_result.corrected_p
+                row["Omnibus_p-value"] = anova_result.p_value
+                row["Omnibus_corrected_p"] = anova_result.corrected_p
             else:
-                row["RM_ANOVA_p-value"] = np.nan
-                row["RM_ANOVA_corrected_p"] = np.nan
+                row["Omnibus_p-value"] = np.nan
+                row["Omnibus_corrected_p"] = np.nan
             
             # Pre-initialize ALL pairwise comparison columns to NaN
             for comparison in all_comparisons:
@@ -577,15 +645,12 @@ class RepeatedMeasuresANOVA:
         # Create DataFrame and organize columns
         combined_df = pd.DataFrame(combined_data)
         
-        # Order columns: Measurement, MeasurementType, then conditions (mean, stderr, n), then RM-ANOVA, then pairwise
-        ordered_columns = ["Measurement", "MeasurementType"]
+        # Order columns: Measurement, MeasurementType, Test_Type, then conditions (mean, stderr, n), then omnibus, then pairwise
+        ordered_columns = ["Measurement", "MeasurementType", "Test_Type", "Omnibus_p-value", "Omnibus_corrected_p"]
         
         # Add condition columns in order
         for cond in all_conditions:
             ordered_columns.extend([f"{cond}_mean", f"{cond}_stderr", f"{cond}_n"])
-        
-        # Add RM-ANOVA columns
-        ordered_columns.extend(["RM_ANOVA_p-value", "RM_ANOVA_corrected_p"])
         
         # Add pairwise columns
         for comparison in all_comparisons:

@@ -1008,7 +1008,7 @@ class MixedANOVA:
                                 import math
                                 group_stats[group_name] = {
                                     'mean': data.mean(),
-                                    'stderr': data.std() / math.sqrt(len(data)) if len(data) > 1 else 0,
+                                    'stderr': data.std(ddof=1) / math.sqrt(len(data)) if len(data) > 1 else 0,
                                     'n': len(data)
                                 }
             

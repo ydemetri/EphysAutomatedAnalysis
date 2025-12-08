@@ -5,6 +5,7 @@ Paired t-test implementation for paired two-group comparisons.
 import pandas as pd
 import numpy as np
 import pingouin as pg
+from scipy.stats import wilcoxon
 import math
 import logging
 import os
@@ -13,7 +14,7 @@ from typing import List, Dict, Tuple, Optional
 import statsmodels.stats.multitest as multi
 
 from ...shared.data_models import ExperimentalDesign, StatisticalResult, DataContainer
-from ...shared.utils import clean_dataframe, categorize_measurement, get_measurement_categories
+from ...shared.utils import clean_dataframe, categorize_measurement, get_measurement_categories, should_use_parametric
 
 logger = logging.getLogger(__name__)
 
@@ -191,13 +192,23 @@ class PairedTTest:
         se1 = data1.std(ddof=1) / math.sqrt(len(data1)) if len(data1) > 1 else 0.0
         se2 = data2.std(ddof=1) / math.sqrt(len(data2)) if len(data2) > 1 else 0.0
         
-        # Run paired t-test using pingouin
+        # Decide parametric vs nonparametric using skewness/kurtosis of differences
+        diffs = data1 - data2
+        use_parametric = should_use_parametric([diffs])
+        
+        # Run paired test
         try:
-            result = pg.ttest(data1, data2, paired=True)
-            p_value = result['p-val'].values[0]
+            if use_parametric:
+                result = pg.ttest(data1, data2, paired=True)
+                p_value = result['p-val'].values[0]
+                test_label = self.name
+            else:
+                # Wilcoxon signed-rank (zero_method 'wilcox' to handle zeros robustly)
+                w_stat, p_value = wilcoxon(data1, data2, zero_method="wilcox", alternative="two-sided")
+                test_label = "Wilcoxon signed-rank"
             
             return StatisticalResult(
-                test_name=self.name,
+                test_name=test_label,
                 measurement=column,
                 group1_name=cond1_name,
                 group1_mean=mean1,
@@ -280,6 +291,7 @@ class PairedTTest:
             row = {
                 "Measurement": result.measurement,
                 "MeasurementType": result.measurement_type,
+                "Test_Type": result.test_name,
                 f"{result.group1_name}_mean": result.group1_mean,
                 f"{result.group1_name}_stderr": result.group1_stderr,
                 f"{result.group1_name}_n": result.group1_n,
@@ -293,8 +305,8 @@ class PairedTTest:
             
         df = pd.DataFrame(data)
         
-        # Explicitly set column order: descriptive stats first, then p-values last
-        base_columns = ["Measurement", "MeasurementType"]
+        # Explicitly set column order: base info, test type, then group stats, then p-values
+        base_columns = ["Measurement", "MeasurementType", "Test_Type"]
         group_columns = []
         p_value_columns = ["p-value", "corrected_p"]
         

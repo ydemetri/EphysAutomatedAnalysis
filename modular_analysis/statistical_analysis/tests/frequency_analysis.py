@@ -4,7 +4,7 @@ Statistical analysis for frequency-related measurements (current vs frequency, f
 
 import pandas as pd
 import numpy as np
-from scipy.stats import ttest_ind, t
+from scipy.stats import ttest_ind, t, kruskal
 import os
 import logging
 import math
@@ -13,8 +13,11 @@ from collections import defaultdict
 
 import statsmodels.stats.multitest as multi
 from statsmodels.formula.api import mixedlm
+from statsmodels.stats.oneway import anova_oneway
+import scikit_posthocs as sp
 
 from ...shared.data_models import ExperimentalDesign, StatisticalResult, DesignType
+from ...shared.utils import should_use_parametric
 from ...shared.config import ProtocolConfig
 from .posthoc_utils import (
     should_run_posthocs,
@@ -382,8 +385,8 @@ class FrequencyAnalyzer:
         if is_factorial:
             anova_results = [r for r in stat_data if r.get('Test_Type') == 'Two-Way ANOVA']
         else:
-            anova_results = [r for r in stat_data if r.get('Test_Type') == 'ANOVA']
-        posthoc_results = [r for r in stat_data if r.get('Test_Type') == 'Post-hoc t-test']
+            anova_results = [r for r in stat_data if r.get('Test_Type') in ['ANOVA', 'Welch_ANOVA', 'Kruskal_Wallis']]
+        posthoc_results = [r for r in stat_data if r.get('Test_Type') in ['Post-hoc t-test', 'Post-hoc Dunn']]
         
         # Save ANOVA results
         if anova_results:
@@ -391,7 +394,7 @@ class FrequencyAnalyzer:
             
             if is_factorial:
                 # For factorial: one row per step with all effects as columns (matching Stats_parameters structure)
-                base_cols = ['Step_Value']
+                base_cols = ['Step_Value', 'Test_Type']
                 
                 # Add group statistics columns (mean, SEM, n for each group) - FIRST after Step_Value
                 # Extract group names and sort them, then add mean, SEM, n for each group in that order
@@ -430,7 +433,7 @@ class FrequencyAnalyzer:
                 available_cols = base_cols + group_stat_cols + effect_cols
             else:
                 # For one-way ANOVA: simpler format (matching Stats_parameters structure)
-                base_cols = ['Step_Value']
+                base_cols = ['Step_Value', 'Test_Type']
                 
                 # Add group statistics columns (mean, SEM, n for each group) - FIRST after Step_Value
                 # Extract group names and sort them, then add mean, SEM, n for each group in that order
@@ -448,8 +451,8 @@ class FrequencyAnalyzer:
                     if f'{group_name}_n' in anova_df.columns:
                         group_stat_cols.append(f'{group_name}_n')
                 
-                # ANOVA statistics last
-                stat_cols = ['F_statistic', 'p_value']
+                # ANOVA statistics last (drop F-stat to avoid NaNs for Welch/KW)
+                stat_cols = ['p_value']
                 if 'corrected_p' in anova_df.columns:
                     stat_cols.append('corrected_p')
                 
@@ -477,7 +480,7 @@ class FrequencyAnalyzer:
             # Organize columns: step info, comparison, group stats, then p-values
             base_cols = ['Step_Value', 'Step_Label', 'Test_Type', 'Comparison']
             group_cols = []
-            stat_cols = ['t_statistic', 'p_value']
+            stat_cols = ['p_value']
             if 'corrected_p' in posthoc_df.columns:
                 stat_cols.append('corrected_p')
             
@@ -560,7 +563,7 @@ class FrequencyAnalyzer:
                     group_step_values[group_name] = step_data
                     group_stats[group_name] = {
                         'mean': step_data.mean(),
-                        'stderr': step_data.std() / np.sqrt(len(step_data)),
+                        'stderr': step_data.std(ddof=1) / np.sqrt(len(step_data)),
                         'n': len(step_data)
                     }
                 else:
@@ -575,6 +578,9 @@ class FrequencyAnalyzer:
             
             # Preserve original ordering for ANOVA input
             group_data_lists = [group_step_values[name] for name in group_names]
+            
+            # Decide parametric vs nonparametric using skewness/kurtosis
+            use_parametric = should_use_parametric(group_data_lists)
             
             # Run ANOVA (one-way or two-way depending on design)
             try:
@@ -595,7 +601,7 @@ class FrequencyAnalyzer:
                                 'factor1': factor1_level,
                                 'factor2': factor2_level
                             })
-                    
+                
                     if len(data_list) >= 4:
                         df = pd.DataFrame(data_list)
                         
@@ -654,18 +660,31 @@ class FrequencyAnalyzer:
                         
                         all_results.append(result)
                 else:
-                    # Regular one-way ANOVA
-                    f_stat, anova_p = f_oneway(*group_data_lists)
+                    # Regular one-way: choose Welch ANOVA or Kruskal-Wallis based on use_parametric
+                    if use_parametric:
+                        try:
+                            welch_res = anova_oneway(group_data_lists, use_var="unequal", welch_correction=True)
+                            anova_p = welch_res.pvalue
+                            test_type = 'Welch_ANOVA'
+                            f_stat = np.nan
+                        except Exception as e:
+                            logger.warning(f"Welch ANOVA failed at {step_label} {step_value}: {e}")
+                            anova_p = np.nan
+                            test_type = 'Welch_ANOVA'
+                            f_stat = np.nan
+                    else:
+                        h_stat, anova_p = kruskal(*group_data_lists)
+                        test_type = 'Kruskal_Wallis'
+                        f_stat = h_stat
                     
-                    # Only include results with valid p-values (like t-test approach)
+                    # Only include results with valid p-values
                     if not np.isnan(anova_p):
                         # Create ANOVA result
                         anova_result = {
                             'Step_Value': step_value,
                             'Step_Label': step_label,
-                            'Test_Type': 'ANOVA',
+                            'Test_Type': test_type,
                             'Comparison': f"Overall ({' vs '.join(group_names)})",
-                            'F_statistic': f_stat,
                             'p_value': anova_p,
                             'measurement_type': f'frequency_{analysis_type}'
                         }
@@ -682,15 +701,14 @@ class FrequencyAnalyzer:
                         anova_result['_run_posthoc'] = len(group_names) > 2  # Mark for potential post-hoc
                         
                         if len(group_names) <= 2:
-                            # For 2 groups, ANOVA directly tests the difference
                             if anova_p < 0.05:
-                                logger.info(f"{step_label} {step_value} ANOVA significant (p={anova_p:.4f}) - no post-hoc needed (only 2 groups)")
+                                logger.info(f"{step_label} {step_value} {test_type} significant (p={anova_p:.4f}) - no post-hoc needed (only 2 groups)")
                             else:
-                                logger.info(f"{step_label} {step_value} ANOVA not significant (p={anova_p:.4f})")
+                                logger.info(f"{step_label} {step_value} {test_type} not significant (p={anova_p:.4f})")
                         else:
-                            logger.info(f"{step_label} {step_value} ANOVA (p={anova_p:.4f}) - will check corrected p-value for post-hoc")
+                            logger.info(f"{step_label} {step_value} {test_type} (p={anova_p:.4f}) - will check corrected p-value for post-hoc")
                     else:
-                        logger.info(f"{step_label} {step_value} ANOVA returned NaN p-value - skipping")
+                        logger.info(f"{step_label} {step_value} {test_type} returned NaN p-value - skipping")
                     
             except Exception as e:
                 logger.warning(f"Error running ANOVA for {step_label} {step_value}: {e}")
@@ -703,7 +721,7 @@ class FrequencyAnalyzer:
             # Now run post-hoc tests based on corrected ANOVA p-values
             posthoc_results = []
             for result in all_results:
-                # For factorial designs, check any effect; for one-way, check main ANOVA
+                # For factorial designs, check any effect; for one-way, check main ANOVA/KW
                 should_run_posthoc = False
                 posthoc_decision = None
                 
@@ -711,8 +729,8 @@ class FrequencyAnalyzer:
                     # For factorial, use helper function to determine if post-hocs needed
                     posthoc_decision = should_run_posthocs(result, design, group_names)
                     should_run_posthoc = posthoc_decision['run_posthocs']
-                elif result.get('Test_Type') == 'ANOVA':
-                    # For one-way ANOVA with 3+ groups
+                elif result.get('Test_Type') in ['ANOVA', 'Welch_ANOVA', 'Kruskal_Wallis']:
+                    # For one-way ANOVA/KW with 3+ groups
                     corrected_p = result.get('corrected_p', result.get('p_value', 1))
                     should_run_posthoc = result.get('_run_posthoc', False) and corrected_p < 0.05
                 
@@ -746,7 +764,7 @@ class FrequencyAnalyzer:
                                     step_group_data[group_name] = step_data
                                     step_group_stats[group_name] = {
                                         'mean': step_data.mean(),
-                                        'stderr': step_data.std() / np.sqrt(len(step_data)),
+                                        'stderr': step_data.std(ddof=1) / np.sqrt(len(step_data)),
                                         'n': len(step_data)
                                     }
                                 else:
@@ -787,7 +805,6 @@ class FrequencyAnalyzer:
                                             'Group2_mean': step_group_stats[group2_name]['mean'],
                                             'Group2_stderr': step_group_stats[group2_name]['stderr'],
                                             'Group2_n': step_group_stats[group2_name]['n'],
-                                            't_statistic': t_stat,
                                             'p_value': pairwise_p,
                                             'measurement_type': f'frequency_{analysis_type}'
                                         }
@@ -816,17 +833,23 @@ class FrequencyAnalyzer:
                             from itertools import combinations
                             comparisons_to_run = list(combinations(step_group_data.keys(), 2))
                             
-                            for group1_name, group2_name in comparisons_to_run:
-                                if group1_name in step_group_data and group2_name in step_group_data:
-                                    t_stat, pairwise_p = ttest_ind(
-                                        step_group_data[group1_name], step_group_data[group2_name],
-                                        nan_policy="omit", equal_var=False
-                                    )
-                                    
+                            if result.get('Test_Type') == 'Kruskal_Wallis':
+                                # Dunn posthocs for KW
+                                values = []
+                                labels = []
+                                for gname, data in step_group_data.items():
+                                    values.extend(list(data.values))
+                                    labels.extend([gname] * len(data))
+                                dunn_input = pd.DataFrame({'val': values, 'grp': labels})
+                                dunn_df = sp.posthoc_dunn(dunn_input, val_col='val', group_col='grp')
+                                dunn_df = dunn_df.reindex(index=step_group_data.keys(), columns=step_group_data.keys())
+                                
+                                for group1_name, group2_name in comparisons_to_run:
+                                    p_val = dunn_df.loc[group1_name, group2_name]
                                     pairwise_result = {
                                         'Step_Value': step_value,
                                         'Step_Label': step_label,
-                                        'Test_Type': 'Post-hoc t-test',
+                                        'Test_Type': 'Post-hoc Dunn',
                                         'Comparison': f"{group1_name} vs {group2_name}",
                                         'Group1': group1_name,
                                         'Group1_mean': step_group_stats[group1_name]['mean'],
@@ -836,11 +859,36 @@ class FrequencyAnalyzer:
                                         'Group2_mean': step_group_stats[group2_name]['mean'],
                                         'Group2_stderr': step_group_stats[group2_name]['stderr'],
                                         'Group2_n': step_group_stats[group2_name]['n'],
-                                        't_statistic': t_stat,
-                                        'p_value': pairwise_p,
+                                        'p_value': p_val,
                                         'measurement_type': f'frequency_{analysis_type}'
                                     }
                                     posthoc_results.append(pairwise_result)
+                            else:
+                                # Welch posthocs
+                                for group1_name, group2_name in comparisons_to_run:
+                                    if group1_name in step_group_data and group2_name in step_group_data:
+                                        t_stat, pairwise_p = ttest_ind(
+                                            step_group_data[group1_name], step_group_data[group2_name],
+                                            nan_policy="omit", equal_var=False
+                                        )
+                                        
+                                        pairwise_result = {
+                                            'Step_Value': step_value,
+                                            'Step_Label': step_label,
+                                            'Test_Type': 'Post-hoc t-test',
+                                            'Comparison': f"{group1_name} vs {group2_name}",
+                                            'Group1': group1_name,
+                                            'Group1_mean': step_group_stats[group1_name]['mean'],
+                                            'Group1_stderr': step_group_stats[group1_name]['stderr'],
+                                            'Group1_n': step_group_stats[group1_name]['n'],
+                                            'Group2': group2_name,
+                                            'Group2_mean': step_group_stats[group2_name]['mean'],
+                                            'Group2_stderr': step_group_stats[group2_name]['stderr'],
+                                            'Group2_n': step_group_stats[group2_name]['n'],
+                                            'p_value': pairwise_p,
+                                            'measurement_type': f'frequency_{analysis_type}'
+                                        }
+                                        posthoc_results.append(pairwise_result)
             
             # Add post-hoc results to all results and apply FDR correction to them
             all_results.extend(posthoc_results)
@@ -909,7 +957,6 @@ class FrequencyAnalyzer:
                 'Group2_mean': stats2['mean'],
                 'Group2_stderr': math.sqrt(stats2['variance']),
                 'Group2_n': stats2['count'],
-                't_statistic': t_statistic,
                 'p_value': p_value,
                 'measurement_type': measurement_type
             }
@@ -1168,6 +1215,9 @@ class FrequencyAnalyzer:
         Handles both regular one-way ANOVA and factorial two-way ANOVA."""
         import statsmodels.stats.multitest as multi
         
+        def _valid_p(val: float) -> bool:
+            return val is not None and np.isfinite(val)
+        
         # Check if we have factorial results
         has_factorial = any('Two-Way ANOVA' in r.get('Test_Type', '') for r in results)
         
@@ -1185,8 +1235,8 @@ class FrequencyAnalyzer:
                 
                 # Correct each effect type separately
                 for effect_col in effect_cols:
-                    pvals = [r[effect_col] for r in anova_results if not np.isnan(r.get(effect_col, np.nan))]
-                    valid_indices = [i for i, r in enumerate(anova_results) if not np.isnan(r.get(effect_col, np.nan))]
+                    pvals = [r.get(effect_col) for r in anova_results if _valid_p(r.get(effect_col, np.nan))]
+                    valid_indices = [i for i, r in enumerate(anova_results) if _valid_p(r.get(effect_col, np.nan))]
                     
                     if len(pvals) > 1:
                         _, corrected_p, _, _ = multi.multipletests(pvals, method="fdr_bh")
@@ -1208,12 +1258,12 @@ class FrequencyAnalyzer:
                             raw_p = result.get(effect_col, np.nan)
                             result[corrected_col] = raw_p if not np.isnan(raw_p) else np.nan
         else:
-            # Regular one-way ANOVA
-            anova_results = [r for r in results if r['Test_Type'] == 'ANOVA']
+            # Regular one-way tests (ANOVA/Welch/KW)
+            anova_results = [r for r in results if r.get('Test_Type') in ['ANOVA', 'Welch_ANOVA', 'Kruskal_Wallis']]
             
             if len(anova_results) > 1:
-                anova_pvals = [r['p_value'] for r in anova_results if not np.isnan(r['p_value'])]
-                valid_indices = [i for i, r in enumerate(anova_results) if not np.isnan(r['p_value'])]
+                anova_pvals = [r['p_value'] for r in anova_results if _valid_p(r.get('p_value'))]
+                valid_indices = [i for i, r in enumerate(anova_results) if _valid_p(r.get('p_value'))]
                 
                 if len(anova_pvals) > 1:
                     _, corrected_p, _, _ = multi.multipletests(anova_pvals, method="fdr_bh")
@@ -1222,18 +1272,18 @@ class FrequencyAnalyzer:
                         
                     # Set NaN corrected p-values for invalid results
                     for i, result in enumerate(anova_results):
-                        if np.isnan(result['p_value']) and 'corrected_p' not in result:
+                        if np.isnan(result.get('p_value', np.nan)) and 'corrected_p' not in result:
                             result['corrected_p'] = np.nan
                 else:
                     # Only 1 or 0 valid p-values - copy raw p-values for valid tests
                     for result in anova_results:
                         raw_p = result.get('p_value', np.nan)
-                        result['corrected_p'] = raw_p if not np.isnan(raw_p) else np.nan
+                        result['corrected_p'] = raw_p if _valid_p(raw_p) else np.nan
                 
-                logger.info(f"Applied FDR correction: {len(anova_results)} ANOVA tests")
+                logger.info(f"Applied FDR correction: {len(anova_results)} one-way tests")
         
         # Apply FDR to post-hoc p-values within each step's family (same for both designs)
-        posthoc_results = [r for r in results if r.get('Test_Type') == 'Post-hoc t-test']
+        posthoc_results = [r for r in results if r.get('Test_Type') in ['Post-hoc t-test', 'Post-hoc Dunn']]
         
         # Group post-hoc results by step value (each ANOVA family)
         step_groups = {}
@@ -1247,8 +1297,8 @@ class FrequencyAnalyzer:
         for step_value, results_list in step_groups.items():
             if len(results_list) > 1:
                 # Extract p-values (filter out NaN)
-                pvals = [r['p_value'] for r in results_list if not np.isnan(r['p_value'])]
-                valid_indices = [i for i, r in enumerate(results_list) if not np.isnan(r['p_value'])]
+                pvals = [r['p_value'] for r in results_list if _valid_p(r['p_value'])]
+                valid_indices = [i for i, r in enumerate(results_list) if _valid_p(r['p_value'])]
                 
                 if len(pvals) > 1:
                     _, corrected_p, _, _ = multi.multipletests(pvals, method="fdr_bh")

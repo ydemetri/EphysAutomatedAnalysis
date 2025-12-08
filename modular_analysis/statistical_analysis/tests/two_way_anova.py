@@ -524,12 +524,12 @@ class TwoWayANOVA:
         # Calculate descriptive statistics
         mean1 = data1.mean()
         mean2 = data2.mean()
-        se1 = data1.std() / math.sqrt(len(data1))
-        se2 = data2.std() / math.sqrt(len(data2))
+        se1 = data1.std(ddof=1) / math.sqrt(len(data1))
+        se2 = data2.std(ddof=1) / math.sqrt(len(data2))
         
-        # Run Welch's t-test (equal_var=False)
+        # Run pooled-variance t-test (aligned with homoscedastic ANOVA)
         try:
-            t_stat, p_value = ttest_ind(data1, data2, nan_policy="omit", equal_var=False)
+            t_stat, p_value = ttest_ind(data1, data2, nan_policy="omit", equal_var=True)
             
             return StatisticalResult(
                 test_name=f"Pairwise t-test ({context})",
@@ -705,7 +705,7 @@ class TwoWayANOVA:
                             if len(data) > 0:
                                 group_stats[group_name] = {
                                     'mean': data.mean(),
-                                    'stderr': data.std() / math.sqrt(len(data)) if len(data) > 1 else 0,
+                                    'stderr': data.std(ddof=1) / math.sqrt(len(data)) if len(data) > 1 else 0,
                                     'n': len(data)
                                 }
             
