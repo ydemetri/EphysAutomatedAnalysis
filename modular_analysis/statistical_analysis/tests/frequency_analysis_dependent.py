@@ -1353,7 +1353,7 @@ class FrequencyAnalyzerDependent:
                                     'Current': current_value,
                                     'Frequency': frequency
                                 })
-        else:  # fold_rheobase - use ALL data for better convergence (not just integers 1-10)
+        else:  # fold_rheobase - limit to folds <= 10 (fractional allowed)
             for group_name, group_data in all_group_data.items():
                 between_level, within_level = self._parse_group_name(group_name, manifest)
                 subject_cols = [col for col in group_data.columns if col.startswith('Subject_')]
@@ -1371,13 +1371,14 @@ class FrequencyAnalyzerDependent:
                             # Calculate actual fold rheobase as current ratio (includes fractional values)
                             current_at_step = (target_idx * self.protocol_config.step_size) + self.protocol_config.min_current
                             actual_fold = current_at_step / rheobase_current if rheobase_current != 0 else 1.0
-                            all_data.append({
-                                'Subject_ID': str(subject_id),
-                                'Between_Factor': between_level,
-                                'Within_Factor': within_level,
-                                'FoldRheobase': actual_fold,
-                                'Frequency': frequency
-                            })
+                            if actual_fold <= 10:
+                                all_data.append({
+                                    'Subject_ID': str(subject_id),
+                                    'Between_Factor': between_level,
+                                    'Within_Factor': within_level,
+                                    'FoldRheobase': actual_fold,
+                                    'Frequency': frequency
+                                })
         
         unified_df = pd.DataFrame(all_data)
         return self._run_global_mixed_effects(unified_df, design, analysis_type)

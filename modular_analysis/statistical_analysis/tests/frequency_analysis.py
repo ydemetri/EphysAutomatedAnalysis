@@ -158,7 +158,7 @@ class FrequencyAnalyzer:
                 results['point_by_point_stats'] = point_stats
                 self._save_point_by_point_results(point_stats, base_path, "Fold_Rheobase", design)
             
-            # Load ALL fold rheobase data (including fractional values) for mixed model - better convergence
+            # Load fold rheobase data (fractional allowed) for mixed model
             all_group_data_full = {}
             for group in design.groups:
                 freq_file = os.path.join(base_path, "Results", f"Calc_{group.name}_frequency_vs_current.csv")
@@ -166,12 +166,14 @@ class FrequencyAnalyzer:
                     try:
                         group_data = self._make_rheo_df(freq_file, group.name, base_path, integers_only=False)
                         if not group_data.empty:
+                            group_data = group_data[group_data['Fold Rheobase'] <= 10]
+                        if not group_data.empty:
                             all_group_data_full[group.name] = group_data
                             logger.info(f"Loaded FULL fold rheobase data for {group.name}: {len(group_data)} steps (vs {len(all_group_data_integers[group.name])} integer steps)")
                     except Exception as e:
                         logger.warning(f"Error loading full fold rheobase data for {group.name}: {e}")
             
-            # Unified mixed-effects model (factorial or regular) - uses ALL data points
+            # Unified mixed-effects model (factorial or regular) - uses folds <= 10
             if len(all_group_data_full) >= 2:
                 mixed_effects_result = self._run_unified_mixed_effects_frequency(all_group_data_full, 'fold_rheobase', design)
                 if mixed_effects_result:
@@ -1014,6 +1016,8 @@ class FrequencyAnalyzer:
                                     step_value = group_data['Fold Rheobase'].iloc[step_idx]
                                 else:
                                     step_value = 0.5 + (step_idx * 0.5)
+                                if step_value > 10:
+                                    continue
                                 
                             steps.append(step_value)
                             frequencies.append(freq_val)
