@@ -490,6 +490,216 @@ class VCTestSweep(Sweep):
 
         return resistance
 
+    def get_capacitance(self, verify=False):
+        """
+        Calculate membrane capacitance from the capacitive transient at voltage step onset.
+        
+        Uses exponential fit method (pClamp approach):
+        1. Fit exponential decay I(t) = A × exp(-t/τ) to 20%-80% of peak response
+        2. The integral of the exponential = A × τ = total charge Q
+        3. Cm = Q / ΔV = (A × τ) / ΔV
+        
+        The 20%-80% fitting window avoids artifacts at onset and noise at the tail.
+        
+        Parameters
+        ----------
+        verify : bool
+            If True, show a plot of the transient and exponential fit.
+            
+        Returns
+        -------
+        capacitance : float
+            Membrane capacitance in pF
+        """
+        from scipy.optimize import curve_fit
+        
+        voltage_base, applied_voltage, voltage_start, voltage_end = \
+            self.fit_input_tophat(verify=False)
+        
+        # Find indices for voltage step
+        start_idx = None
+        for idx, t in enumerate(self.time_steps):
+            if t >= voltage_start and start_idx is None:
+                start_idx = idx
+                break
+        
+        end_idx = None
+        for idx, t in enumerate(self.time_steps):
+            if t >= voltage_end:
+                end_idx = idx
+                break
+        
+        if start_idx is None or end_idx is None:
+            logger.warning('Could not find voltage step for capacitance calculation')
+            return np.nan
+        
+        # Get steady-state current
+        measurement_slice_start = start_idx + (end_idx - start_idx) // 4
+        measurement_slice_end = start_idx + 3 * (end_idx - start_idx) // 4
+        steady_state_current = np.mean(
+            self.output_signal[measurement_slice_start:measurement_slice_end])
+        
+        # Extract transient - use first 50ms max as fitting window (generous upper bound)
+        # Large cells with Cm>100pF and Rs>10MΩ can have τ_transient up to 10ms
+        max_fit_window = 0.050  # 50ms
+        fit_end_idx = None
+        for idx, t in enumerate(self.time_steps):
+            if t >= voltage_start + max_fit_window:
+                fit_end_idx = idx
+                break
+        if fit_end_idx is None:
+            fit_end_idx = end_idx
+        fit_end_idx = min(fit_end_idx, end_idx)
+        
+        # Get full transient data (baseline subtracted)
+        full_transient = self.output_signal[start_idx:fit_end_idx] - steady_state_current
+        full_time = self.time_steps[start_idx:fit_end_idx] - self.time_steps[start_idx]
+        
+        if len(full_time) < 10:
+            logger.warning('Insufficient data points for exponential fit')
+            return np.nan
+        
+        # Find peak of transient (maximum absolute deviation from baseline)
+        peak_idx = np.argmax(np.abs(full_transient))
+        peak_value = full_transient[peak_idx]
+        
+        if abs(peak_value) < 1e-10:
+            logger.warning('No transient detected')
+            return np.nan
+        
+        # Find 20% and 80% of peak response for fitting window (pClamp method)
+        # 80% is closer to peak, 20% is closer to baseline
+        target_80 = 0.80 * peak_value
+        target_20 = 0.20 * peak_value
+        
+        # Smooth transient for robust threshold crossing detection (avoids noise spikes)
+        # Use 5-point moving average, but fit on raw data
+        kernel_size = min(5, len(full_transient) // 10) if len(full_transient) > 20 else 1
+        if kernel_size > 1:
+            kernel = np.ones(kernel_size) / kernel_size
+            smoothed = np.convolve(full_transient, kernel, mode='same')
+        else:
+            smoothed = full_transient
+        
+        # Find indices where transient crosses 80% and 20% thresholds (after peak)
+        fit_start_idx = peak_idx
+        fit_end_idx_local = len(full_transient) - 1
+        
+        sign = np.sign(peak_value)
+        for i in range(peak_idx, len(smoothed)):
+            if sign * smoothed[i] <= sign * target_80 and fit_start_idx == peak_idx:
+                fit_start_idx = i
+            if sign * smoothed[i] <= sign * target_20:
+                fit_end_idx_local = i
+                break
+        
+        # Extract 20-80% region for fitting
+        transient_current = full_transient[fit_start_idx:fit_end_idx_local+1]
+        transient_time = full_time[fit_start_idx:fit_end_idx_local+1]
+        
+        if len(transient_time) < 5:
+            # Fall back to full transient if 20-80% window too small
+            fit_start_idx = peak_idx  # Update fit_start_idx for correct extrapolation
+            transient_current = full_transient[peak_idx:]
+            transient_time = full_time[peak_idx:]
+        
+        # Shift time to start at 0 for fitting
+        transient_time = transient_time - transient_time[0]
+        
+        # Define exponential decay function
+        def exp_decay(t, A, tau):
+            return A * np.exp(-t / tau)
+        
+        # Initial guesses
+        A_guess = transient_current[0] if len(transient_current) > 0 else 100
+        tau_guess = 0.001  # 1ms initial guess
+        
+        try:
+            # Fit exponential to the 20-80% region
+            sign = np.sign(A_guess) if A_guess != 0 else 1
+            popt, _ = curve_fit(
+                exp_decay, 
+                transient_time, 
+                transient_current * sign,  # Make positive for fitting
+                p0=[abs(A_guess), tau_guess],
+                bounds=([0, 1e-6], [np.inf, 0.1]),  # A > 0, tau between 1µs and 100ms
+                maxfev=5000
+            )
+            A_fit, tau_fit = popt
+            A_fit = A_fit * sign  # Restore sign
+            
+            # Check if tau hit lower bound - indicates fit couldn't find proper decay
+            if tau_fit <= 1.1e-6:
+                logger.warning(f'Exponential fit failed: tau hit lower bound ({tau_fit*1000:.4f}ms)')
+                return np.nan
+            
+        except (RuntimeError, ValueError) as e:
+            logger.warning(f'Exponential fit failed for capacitance: {e}')
+            return np.nan
+        
+        # Extrapolate A to t=0 (step onset) for proper charge calculation
+        # A_fit is the amplitude at the start of our fit window (80% point)
+        # full_time[fit_start_idx] is the time from step onset to fit window start
+        # For ideal RC: I(t) = A₀ × exp(-t/τ), so A₀ = A_fit × exp(t_fit/τ)
+        exponent = full_time[fit_start_idx] / tau_fit
+        if exponent > 20:  # exp(20) ≈ 485 million, indicates tau too small for fit window
+            logger.warning(f'Extrapolation unstable: exponent={exponent:.1f} (tau={tau_fit*1000:.3f}ms)')
+            return np.nan
+        A_at_t0 = A_fit * np.exp(exponent)
+        
+        # Calculate capacitance from exponential fit
+        # Integral of A*exp(-t/tau) from 0 to infinity = A * tau = charge Q (in pA*s = pC)
+        charge_pC = abs(A_at_t0 * tau_fit)
+        
+        # Cm = Q / ΔV
+        # charge in pC, voltage in mV
+        # pC / mV = (1e-12 C) / (1e-3 V) = 1e-9 F = 1 nF
+        # Multiply by 1000 to get pF
+        delta_v_mV = abs(applied_voltage - voltage_base)
+        if delta_v_mV < 0.5:  # Less than 0.5 mV is too small for reliable calculation
+            logger.warning(f'Voltage step too small ({delta_v_mV:.2f} mV), cannot calculate capacitance')
+            return np.nan
+            
+        capacitance_pF = (charge_pC / delta_v_mV) * 1000
+        
+        if verify:
+            import matplotlib.pyplot as plt
+            plt.figure(figsize=(12, 8))
+            
+            # Plot full trace
+            plt.subplot(2, 1, 1)
+            plt.plot(self.time_steps, self.output_signal, label='Current')
+            plt.axvline(voltage_start, color='g', linestyle='--', label='Step onset')
+            plt.axhline(steady_state_current, color='orange', linestyle=':', label='Steady-state')
+            plt.xlabel('Time (s)')
+            plt.ylabel('Current (pA)')
+            plt.legend()
+            plt.title(f'Capacitance = {capacitance_pF:.1f} pF (τ = {tau_fit*1000:.2f} ms)')
+            
+            # Plot transient with fit
+            plt.subplot(2, 1, 2)
+            plt.plot(full_time * 1000, full_transient, 'b-', label='Full transient', alpha=0.5)
+            plt.plot((transient_time + full_time[fit_start_idx]) * 1000, transient_current, 
+                     'g-', linewidth=2, label='20-80% fit region')
+            # Show extrapolated fit from t=0 (step onset)
+            fit_t = np.linspace(0, full_time[-1], 500)
+            fit_curve = exp_decay(fit_t, abs(A_at_t0), tau_fit) * np.sign(A_at_t0)
+            plt.plot(fit_t * 1000, fit_curve, 'r--', linewidth=2, 
+                     label=f'Exp fit: A₀={A_at_t0:.1f} pA, τ={tau_fit*1000:.2f} ms')
+            plt.axhline(0, color='gray', linestyle=':')
+            plt.xlabel('Time from step onset (ms)')
+            plt.ylabel('Current - baseline (pA)')
+            plt.legend()
+            plt.title(f'Charge = A₀×τ = {charge_pC:.3f} pC (extrapolated to t=0)')
+            plt.xlim([0, min(20, full_time[-1]*1000)])
+            
+            plt.tight_layout()
+            plt.show()
+        
+        logger.info('Capacitance from sweep {} is {} pF (tau={:.2f}ms)'.format(
+            self.sweep_name, capacitance_pF, tau_fit*1000))
+        return capacitance_pF
+
 
 class EToIRatioSweep(Sweep):
     """Functions to extract relevant data from an EtoIRatio sweep"""
@@ -800,6 +1010,19 @@ class VCTestData(ExperimentData):
             raise NotImplementedError
 
         return resistances
+
+    def get_capacitance(self, verify=False):
+        """
+        Membrane capacitance: calculate from the capacitive transient at voltage step onset.
+        Uses the charge integration method: C = Q / ΔV
+
+        :return: list of capacitance values (pF) for each sweep
+        """
+        capacitances = []
+        for sweep in self.sweeps:
+            capacitances.append(sweep.get_capacitance(verify=verify))
+
+        return capacitances
 
 
 class CurrentClampGapFreeData(ExperimentData):

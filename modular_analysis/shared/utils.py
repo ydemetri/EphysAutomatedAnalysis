@@ -96,7 +96,8 @@ def get_measurement_categories() -> Dict[str, List[str]]:
     return {
         "Intrinsic Property": [
             "Vm (mV)",
-            "Rm (MOhm)", 
+            "Rm (MOhm)",
+            "Cm (pF)",
             "Time Constant (ms)",
             "Sag",
             "Rheobase (pA)"
@@ -193,7 +194,7 @@ def create_output_paths(base_path: str, group_names: List[str]) -> Dict[str, Dic
     
     protocols = {
         'brief_current': 'afterhyperpolarization',
-        'membrane_test': 'input_resistance', 
+        'membrane_test': 'membrane_properties', 
         'gap_free': 'resting_potential',
         'current_steps': ['current_step_parameters', 'frequency_vs_current', 'attenuation']
     }

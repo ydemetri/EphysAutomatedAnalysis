@@ -607,7 +607,7 @@ class TwoWayANOVA:
         dfs = []
         data_types = [
             f"Calc_{group_name}_resting_potential.csv",
-            f"Calc_{group_name}_input_resistance.csv", 
+            f"Calc_{group_name}_membrane_properties.csv", 
             f"Calc_{group_name}_current_step_parameters.csv",
             f"Calc_{group_name}_afterhyperpolarization.csv"
         ]

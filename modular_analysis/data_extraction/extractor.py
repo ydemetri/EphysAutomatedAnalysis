@@ -132,13 +132,13 @@ class DataExtractor:
         try:
             input_path = os.path.join(group.folder_path, "Membrane_test_vc")
             output_path = os.path.join(base_path, self.config.output_dir,
-                                     f"Calc_{group.name}_input_resistance.csv")
+                                     f"Calc_{group.name}_membrane_properties.csv")
             
             if not os.path.isdir(input_path):
                 logger.warning(f"Membrane test directory not found: {input_path}")
                 return False
                 
-            joannas_vc_test.get_input_resistance_from_vc(input_path, output_path)
+            joannas_vc_test.get_membrane_properties_from_vc(input_path, output_path)
             
             return validate_file_exists(output_path)
             
