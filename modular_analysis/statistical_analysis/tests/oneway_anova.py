@@ -31,7 +31,7 @@ class OneWayANOVA:
         self.name = "One-way ANOVA"
         
     def run_analysis(self, design: ExperimentalDesign, data_container: DataContainer, 
-                    base_path: str) -> List[StatisticalResult]:
+                    base_path: str, selected_measurements: Optional[List[str]] = None) -> List[StatisticalResult]:
         """Run one-way ANOVA analysis for multiple groups."""
         
         if len(design.groups) < 3:
@@ -51,6 +51,11 @@ class OneWayANOVA:
         
         # Get column names for analysis
         analysis_columns = self._get_analysis_columns(list(group_data.values())[0])
+        
+        # Filter by selected measurements if provided
+        if selected_measurements:
+            analysis_columns = [col for col in analysis_columns if col in selected_measurements]
+            logger.info(f"Filtered to {len(analysis_columns)} selected measurements")
         
         # Run ANOVA for each measurement
         results = []

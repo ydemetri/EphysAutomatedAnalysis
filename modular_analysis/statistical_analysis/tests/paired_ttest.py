@@ -26,7 +26,7 @@ class PairedTTest:
         self.name = "Paired t-test"
         
     def run_analysis(self, design: ExperimentalDesign, data_container: DataContainer, 
-                    base_path: str) -> List[StatisticalResult]:
+                    base_path: str, selected_measurements: Optional[List[str]] = None) -> List[StatisticalResult]:
         """Run paired t-test analysis for two conditions."""
         
         if len(design.groups) != 2:
@@ -64,6 +64,11 @@ class PairedTTest:
         
         # Get column names for analysis (exclude metadata columns)
         analysis_columns = self._get_analysis_columns(unified_df)
+        
+        # Filter by selected measurements if provided
+        if selected_measurements:
+            analysis_columns = [col for col in analysis_columns if col in selected_measurements]
+            logger.info(f"Filtered to {len(analysis_columns)} selected measurements")
         
         # Run paired t-tests for each measurement
         results = []

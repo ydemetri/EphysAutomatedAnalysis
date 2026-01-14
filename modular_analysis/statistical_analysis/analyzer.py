@@ -38,10 +38,23 @@ class StatisticalAnalyzer:
         self.attenuation_analyzer_dependent = AttenuationAnalyzerDependent()
         self.extractor = DataExtractor(config)  # For adding Subject_IDs in mixed designs
         
-    def run_analysis(self, design: ExperimentalDesign, base_path: str) -> Dict[str, any]:
-        """Run complete statistical analysis for the given design."""
+    def run_analysis(self, design: ExperimentalDesign, base_path: str, 
+                     selected_measurements: Optional[List[str]] = None) -> Dict[str, any]:
+        """Run complete statistical analysis for the given design.
+        
+        Parameters
+        ----------
+        design : ExperimentalDesign
+            The experimental design to analyze
+        base_path : str
+            Path to the data directory
+        selected_measurements : Optional[List[str]]
+            List of measurement names to include in analysis. If None, all measurements are included.
+        """
         
         logger.info(f"Starting analysis: {design.name}")
+        if selected_measurements:
+            logger.info(f"Analyzing {len(selected_measurements)} selected measurements")
         
         log_handler = None
         log_file_path = None
@@ -89,7 +102,7 @@ class StatisticalAnalyzer:
                 )
             
             # Run basic statistical tests (measurement comparisons)
-            statistical_results = self._run_statistical_tests(design, base_path)
+            statistical_results = self._run_statistical_tests(design, base_path, selected_measurements)
             results['statistical_results'] = statistical_results
             
             # Save basic statistical results
@@ -129,28 +142,29 @@ class StatisticalAnalyzer:
             
         return results
     
-    def _run_statistical_tests(self, design: ExperimentalDesign, base_path: str) -> List[StatisticalResult]:
+    def _run_statistical_tests(self, design: ExperimentalDesign, base_path: str,
+                               selected_measurements: Optional[List[str]] = None) -> List[StatisticalResult]:
         """Select and run appropriate statistical tests based on design type."""
         
         if design.design_type == DesignType.INDEPENDENT_TWO_GROUP:
             test = UnpairedTTest()
-            return test.run_analysis(design, None, base_path)
+            return test.run_analysis(design, None, base_path, selected_measurements)
         elif design.design_type == DesignType.PAIRED_TWO_GROUP:
             test = PairedTTest()
-            return test.run_analysis(design, None, base_path)
+            return test.run_analysis(design, None, base_path, selected_measurements)
         elif design.design_type == DesignType.INDEPENDENT_MULTI_GROUP:
             test = OneWayANOVA()
-            return test.run_analysis(design, None, base_path)
+            return test.run_analysis(design, None, base_path, selected_measurements)
         elif design.design_type == DesignType.REPEATED_MEASURES:
             from .tests.repeated_measures_anova import RepeatedMeasuresANOVA
             test = RepeatedMeasuresANOVA()
-            return test.run_analysis(design, None, base_path)
+            return test.run_analysis(design, None, base_path, selected_measurements)
         elif design.design_type == DesignType.FACTORIAL_2X2:
             test = TwoWayANOVA()
-            return test.run_analysis(design, None, base_path)
+            return test.run_analysis(design, None, base_path, selected_measurements)
         elif design.design_type == DesignType.MIXED_FACTORIAL:
             test = MixedANOVA()
-            return test.run_analysis(design, None, base_path)
+            return test.run_analysis(design, None, base_path, selected_measurements)
         else:
             raise NotImplementedError(f"Design type {design.design_type} not yet implemented")
     

@@ -28,7 +28,7 @@ class MixedANOVA:
         self.name = "Mixed ANOVA"
         
     def run_analysis(self, design: ExperimentalDesign, container: DataContainer, 
-                    base_path: str) -> List[StatisticalResult]:
+                    base_path: str, selected_measurements: Optional[List[str]] = None) -> List[StatisticalResult]:
         """
         Run mixed model analysis for general parameters.
         
@@ -36,6 +36,7 @@ class MixedANOVA:
             design: ExperimentalDesign with dependent design type
             container: DataContainer (not used, kept for consistency)
             base_path: Base directory path
+            selected_measurements: Optional list of measurement names to include
             
         Returns:
             List of StatisticalResult objects
@@ -73,6 +74,11 @@ class MixedANOVA:
         
         # Get column names for analysis
         analysis_columns = self._get_analysis_columns(unified_df)
+        
+        # Filter by selected measurements if provided
+        if selected_measurements:
+            analysis_columns = [col for col in analysis_columns if col in selected_measurements]
+            logger.info(f"Filtered to {len(analysis_columns)} selected measurements")
         
         # Run mixed model for each measurement
         mixed_results = []

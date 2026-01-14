@@ -34,7 +34,7 @@ class TwoWayANOVA:
         self._measurement_fit_info = {}
         
     def run_analysis(self, design: ExperimentalDesign, container: DataContainer, 
-                    base_path: str) -> List[StatisticalResult]:
+                    base_path: str, selected_measurements: Optional[List[str]] = None) -> List[StatisticalResult]:
         """Run two-way ANOVA for N×M factorial design."""
 
         # Reset cached model info for this run
@@ -65,6 +65,11 @@ class TwoWayANOVA:
         
         # Get column names for analysis
         analysis_columns = self._get_analysis_columns(list(group_data.values())[0])
+        
+        # Filter by selected measurements if provided
+        if selected_measurements:
+            analysis_columns = [col for col in analysis_columns if col in selected_measurements]
+            logger.info(f"Filtered to {len(analysis_columns)} selected measurements")
         
         # Run two-way ANOVA for each measurement
         anova_results = []

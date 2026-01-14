@@ -27,7 +27,7 @@ class RepeatedMeasuresANOVA:
         self.name = "Repeated Measures ANOVA"
         
     def run_analysis(self, design: ExperimentalDesign, data_container: DataContainer, 
-                    base_path: str) -> List[StatisticalResult]:
+                    base_path: str, selected_measurements: Optional[List[str]] = None) -> List[StatisticalResult]:
         """Run repeated measures ANOVA analysis for 3+ conditions."""
         
         if len(design.groups) < 3:
@@ -56,6 +56,11 @@ class RepeatedMeasuresANOVA:
         
         # Get column names for analysis
         analysis_columns = self._get_analysis_columns(list(all_group_data.values())[0])
+        
+        # Filter by selected measurements if provided
+        if selected_measurements:
+            analysis_columns = [col for col in analysis_columns if col in selected_measurements]
+            logger.info(f"Filtered to {len(analysis_columns)} selected measurements")
         
         # Run RM-ANOVA for each measurement
         results = []

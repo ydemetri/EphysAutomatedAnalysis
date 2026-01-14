@@ -74,6 +74,10 @@ class ModularAnalysisApp:
         self.selected_groups = []
         self.analysis_running = False
         
+        # Measurement selection state (will be populated in setup_measurement_tab)
+        self.measurement_vars = {}  # Dict[str, tk.BooleanVar] for each measurement
+        self.category_vars = {}  # Dict[str, tk.BooleanVar] for Select All per category
+        
         self.setup_ui()
         
     def setup_ui(self):
@@ -92,7 +96,12 @@ class ModularAnalysisApp:
         notebook.add(extraction_frame, text="Data Extraction")
         self.setup_extraction_tab(extraction_frame)
         
-        # Tab 3: Statistical Analysis  
+        # Tab 3: Measurement Selection
+        measurement_frame = ttk.Frame(notebook)
+        notebook.add(measurement_frame, text="Measurement Selection")
+        self.setup_measurement_tab(measurement_frame)
+        
+        # Tab 4: Statistical Analysis  
         analysis_frame = ttk.Frame(notebook)
         notebook.add(analysis_frame, text="Statistical Analysis")
         self.setup_analysis_tab(analysis_frame)
@@ -170,6 +179,119 @@ class ModularAnalysisApp:
         
         self.extraction_details.pack(side='left', fill='both', expand=True)
         details_scrollbar.pack(side='right', fill='y')
+    
+    def setup_measurement_tab(self, parent):
+        """Set up the measurement selection tab."""
+        from modular_analysis.shared.utils import get_measurement_categories
+        
+        # Center everything vertically and horizontally
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
+        
+        # Main centered frame
+        center_frame = ttk.Frame(parent)
+        center_frame.grid(row=0, column=0)
+        
+        # Instructions
+        instruction_frame = ttk.LabelFrame(center_frame, text="Instructions", padding=10)
+        instruction_frame.pack(pady=(20, 10))
+        
+        ttk.Label(instruction_frame, 
+                  text="Select which measurements to include in statistical analysis.\n"
+                       "Reducing the number of measurements reduces the multiple comparison correction penalty.").pack()
+        
+        # Get measurement categories
+        categories = get_measurement_categories()
+        
+        # Horizontal frame for categories side by side
+        categories_frame = ttk.Frame(center_frame)
+        categories_frame.pack(pady=10)
+        
+        # Create checkboxes for each category - side by side
+        for category_name, measurements in categories.items():
+            # Category frame
+            cat_frame = ttk.LabelFrame(categories_frame, text=category_name, padding=10)
+            cat_frame.pack(side='left', padx=10, anchor='n')
+            
+            # Select All checkbox for this category
+            self.category_vars[category_name] = tk.BooleanVar(value=True)
+            select_all_cb = ttk.Checkbutton(
+                cat_frame, 
+                text="Select All", 
+                variable=self.category_vars[category_name],
+                command=lambda cat=category_name, meas=measurements: self._toggle_category(cat, meas)
+            )
+            select_all_cb.pack(anchor='w')
+            
+            # Separator
+            ttk.Separator(cat_frame, orient='horizontal').pack(fill='x', pady=5)
+            
+            # Individual measurement checkboxes
+            for measurement in measurements:
+                self.measurement_vars[measurement] = tk.BooleanVar(value=True)
+                cb = ttk.Checkbutton(
+                    cat_frame,
+                    text=measurement,
+                    variable=self.measurement_vars[measurement],
+                    command=lambda cat=category_name, meas=measurements: self._update_category_checkbox(cat, meas)
+                )
+                cb.pack(anchor='w', padx=20)
+        
+        # Buttons frame - centered below
+        button_frame = ttk.Frame(center_frame)
+        button_frame.pack(pady=20)
+        
+        ttk.Button(button_frame, text="Select All", command=self._select_all_measurements).pack(side='left', padx=5)
+        ttk.Button(button_frame, text="Deselect All", command=self._deselect_all_measurements).pack(side='left', padx=5)
+        
+        # Summary label
+        self.measurement_summary = ttk.Label(button_frame, text="")
+        self.measurement_summary.pack(side='left', padx=20)
+        self._update_measurement_summary()
+    
+    def _toggle_category(self, category_name: str, measurements: list):
+        """Toggle all measurements in a category when Select All is clicked."""
+        select_all = self.category_vars[category_name].get()
+        for measurement in measurements:
+            if measurement in self.measurement_vars:
+                self.measurement_vars[measurement].set(select_all)
+        self._update_measurement_summary()
+    
+    def _update_category_checkbox(self, category_name: str, measurements: list):
+        """Update the Select All checkbox based on individual measurement selections."""
+        all_selected = all(
+            self.measurement_vars[m].get() 
+            for m in measurements 
+            if m in self.measurement_vars
+        )
+        self.category_vars[category_name].set(all_selected)
+        self._update_measurement_summary()
+    
+    def _select_all_measurements(self):
+        """Select all measurements."""
+        for var in self.measurement_vars.values():
+            var.set(True)
+        for var in self.category_vars.values():
+            var.set(True)
+        self._update_measurement_summary()
+    
+    def _deselect_all_measurements(self):
+        """Deselect all measurements."""
+        for var in self.measurement_vars.values():
+            var.set(False)
+        for var in self.category_vars.values():
+            var.set(False)
+        self._update_measurement_summary()
+    
+    def _update_measurement_summary(self):
+        """Update the summary label showing how many measurements are selected."""
+        selected = sum(1 for var in self.measurement_vars.values() if var.get())
+        total = len(self.measurement_vars)
+        self.measurement_summary.config(text=f"{selected}/{total} measurements selected")
+    
+    def get_selected_measurements(self) -> list:
+        """Get list of selected measurement names."""
+        return [name for name, var in self.measurement_vars.items() if var.get()]
         
     def setup_analysis_tab(self, parent):
         """Set up the statistical analysis tab."""
@@ -616,6 +738,7 @@ class ModularAnalysisApp:
                     'gray': 'gray',
                     'olive': 'olive',
                     'cyan': 'cyan',
+                    'medium blue': '#0080FF',
                     'light blue': '#87CEEB',
                     'light red': '#FFA07A'
                 }
@@ -676,8 +799,11 @@ class ModularAnalysisApp:
                         level_italic=factor_mapping.get('level_italic', {})
                     )
                 
+                # Get selected measurements from GUI
+                selected_measurements = self.get_selected_measurements()
+                
                 # Run analysis
-                results = self.analyzer.run_analysis(design, self.base_path.get())
+                results = self.analyzer.run_analysis(design, self.base_path.get(), selected_measurements)
                 
                 if results['success']:
                     self.root.after(0, lambda: messagebox.showinfo("Analysis Complete", "Done"))
@@ -765,6 +891,7 @@ class ModularAnalysisApp:
             'gray': 'gray',
             'olive': 'olive',
             'cyan': 'cyan',
+            'medium blue': '#0080FF',
             'light blue': '#87CEEB',
             'light red': '#FFA07A'
         }
